@@ -918,6 +918,7 @@ public class FragmentPlayerFull extends Fragment {
                 fragmentPlayerFull.updateRunningRecording();
             } else {
                 fragmentPlayerFull.seekBarPlayhead.setEnabled(false);
+                fragmentPlayerFull.seekBarPlayhead.setVisibility(View.GONE);
             }
         }
     }

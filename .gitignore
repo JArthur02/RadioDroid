@@ -42,4 +42,3 @@ build/*
 .DS_Store
 
 *.aab
-local.properties

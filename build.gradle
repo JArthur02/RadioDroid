@@ -15,5 +15,13 @@ allprojects {
         google()
         mavenCentral()
         maven { url 'https://jitpack.io' }
+        // JCenter is read-only/offline. This scoped mirror keeps the last Android-4-compatible
+        // picasso-transformations artifact available without routing other dependencies through it.
+        maven {
+            url 'https://maven.aliyun.com/repository/jcenter'
+            content {
+                includeModule 'jp.wasabeef', 'picasso-transformations'
+            }
+        }
     }
 }

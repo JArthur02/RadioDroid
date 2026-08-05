@@ -16,19 +16,17 @@ import okhttp3.OkHttpClient;
 
 
 class IcyDataSourceTest {
-    private static IcyDataSource icyDataSource;
-    private static StringBuffer transferredBytesWithoutMetadata;
-
-    @BeforeAll
-    public static void setup() {
-        icyDataSource = new IcyDataSource(new OkHttpClient(), new TestTransferListener(), new TestDataSourceListener());
-        icyDataSource.shoutcastInfo = new ShoutcastInfo();
-        icyDataSource.shoutcastInfo.metadataOffset = 16000;
-    }
+    private IcyDataSource icyDataSource;
+    private StringBuffer transferredBytesWithoutMetadata;
+    private StreamLiveInfo lastLiveInfo;
 
     @BeforeEach
     void init() {
         transferredBytesWithoutMetadata = new StringBuffer();
+        icyDataSource = new IcyDataSource(new OkHttpClient(), new TestTransferListener(), new TestDataSourceListener());
+        icyDataSource.shoutcastInfo = new ShoutcastInfo();
+        icyDataSource.shoutcastInfo.metadataOffset = 16000;
+        icyDataSource.remainingUntilMetadata = 16000;
     }
 
     @Test
@@ -77,7 +75,20 @@ class IcyDataSourceTest {
         assertEquals(0, icyDataSource.metadataBytesToSkip);
     }
 
-    static class TestDataSourceListener implements IcyDataSource.IcyDataSourceListener {
+    @Test
+    void sendToDataSourceListenersWithoutMetadata_publishesCompleteMetadata() {
+        icyDataSource.shoutcastInfo.metadataOffset = 6;
+        icyDataSource.remainingUntilMetadata = 6;
+
+        final byte[] buffer = "audio1\u0001StreamTitle='X';audio2".getBytes();
+        icyDataSource.sendToDataSourceListenersWithoutMetadata(buffer, 0, buffer.length);
+
+        assertEquals("audio1audio2", transferredBytesWithoutMetadata.toString());
+        assertNotNull(lastLiveInfo);
+        assertEquals("X", lastLiveInfo.getTitle());
+    }
+
+    class TestDataSourceListener implements IcyDataSource.IcyDataSourceListener {
 
         @Override
         public void onDataSourceConnected() {
@@ -101,7 +112,7 @@ class IcyDataSourceTest {
 
         @Override
         public void onDataSourceStreamLiveInfo(StreamLiveInfo streamLiveInfo) {
-
+            lastLiveInfo = streamLiveInfo;
         }
 
         @Override

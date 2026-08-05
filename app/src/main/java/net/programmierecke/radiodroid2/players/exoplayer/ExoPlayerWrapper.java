@@ -17,9 +17,7 @@ import androidx.annotation.Nullable;
 import androidx.preference.PreferenceManager;
 
 import com.google.android.exoplayer2.C;
-import com.google.android.exoplayer2.DefaultLoadControl;
 import com.google.android.exoplayer2.ExoPlayer;
-import com.google.android.exoplayer2.LoadControl;
 import com.google.android.exoplayer2.MediaItem;
 import com.google.android.exoplayer2.PlaybackException;
 import com.google.android.exoplayer2.PlaybackParameters;
@@ -57,11 +55,6 @@ public class ExoPlayerWrapper implements PlayerWrapper, IcyDataSource.IcyDataSou
 
     final private String TAG = "ExoPlayerWrapper";
 
-    /** How far back from the live edge the user can scrub (timeshift window). */
-    private static final int TIMESHIFT_BACK_BUFFER_MS = 2 * 60 * 60 * 1000; // 2 hours
-    /** Max forward buffer; slightly larger than back buffer so live edge stays ahead. */
-    private static final int TIMESHIFT_MAX_BUFFER_MS = TIMESHIFT_BACK_BUFFER_MS + 60_000;
-
     private ExoPlayer player;
     private PlayListener stateListener;
 
@@ -81,13 +74,17 @@ public class ExoPlayerWrapper implements PlayerWrapper, IcyDataSource.IcyDataSou
 
     private Context context;
     private MediaSource audioSource;
+    private TimeshiftBuffer timeshiftBuffer;
+    private long playbackBasePositionMs;
+    private boolean networkReceiverRegistered;
 
     private Runnable fullStopTask;
 
     private final BroadcastReceiver networkChangedReceiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
-            if (fullStopTask != null && player != null && audioSource != null && Utils.hasAnyConnection(context)) {
+            if (isHls && fullStopTask != null && player != null && audioSource != null
+                    && Utils.hasAnyConnection(context)) {
                 Log.i(TAG, "Regained connection. Resuming playback.");
 
                 cancelStopTask();
@@ -117,20 +114,10 @@ public class ExoPlayerWrapper implements PlayerWrapper, IcyDataSource.IcyDataSou
         if (player != null) {
             player.stop();
         }
+        closeTimeshiftBuffer();
 
         if (player == null) {
-            LoadControl loadControl = new DefaultLoadControl.Builder()
-                    .setBufferDurationsMs(
-                            DefaultLoadControl.DEFAULT_MIN_BUFFER_MS,
-                            TIMESHIFT_MAX_BUFFER_MS,
-                            DefaultLoadControl.DEFAULT_BUFFER_FOR_PLAYBACK_MS,
-                            DefaultLoadControl.DEFAULT_BUFFER_FOR_PLAYBACK_AFTER_REBUFFER_MS)
-                    .setBackBuffer(TIMESHIFT_BACK_BUFFER_MS, /* retainFromKeyframe= */ true)
-                    .build();
-
-            player = new ExoPlayer.Builder(context)
-                    .setLoadControl(loadControl)
-                    .build();
+            player = new ExoPlayer.Builder(context).build();
             player.setAudioAttributes(new AudioAttributes.Builder().setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
                     .setUsage(isAlarm ? C.USAGE_ALARM : C.USAGE_MEDIA).build(), false);
 
@@ -143,6 +130,7 @@ public class ExoPlayerWrapper implements PlayerWrapper, IcyDataSource.IcyDataSou
         }
 
         isHls = Utils.urlIndicatesHlsStream(streamUrl);
+        playbackBasePositionMs = 0;
 
         SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(context.getApplicationContext());
         final int retryTimeout = prefs.getInt("settings_retry_timeout", 10);
@@ -151,9 +139,25 @@ public class ExoPlayerWrapper implements PlayerWrapper, IcyDataSource.IcyDataSou
         DataSource.Factory dataSourceFactory = new RadioDataSourceFactory(httpClient, bandwidthMeter, this, retryTimeout, retryDelay);
         // Produces Extractor instances for parsing the media data.
         if (!isHls) {
-            audioSource = new ProgressiveMediaSource.Factory(dataSourceFactory)
-                    .setLoadErrorHandlingPolicy(new CustomLoadErrorHandlingPolicy())
-                    .createMediaSource(MediaItem.fromUri(Uri.parse(streamUrl)));
+            try {
+                timeshiftBuffer = new TimeshiftBuffer(
+                        context.getCacheDir(),
+                        streamUrl,
+                        httpClient,
+                        bandwidthMeter,
+                        this,
+                        retryTimeout,
+                        retryDelay);
+                timeshiftBuffer.start();
+                TimeshiftBuffer.SeekTarget initialTarget = timeshiftBuffer.resolveSeekTarget(0);
+                playbackBasePositionMs = initialTarget.timeMs;
+                audioSource = createTimeshiftMediaSource(initialTarget);
+            } catch (IOException error) {
+                Log.e(TAG, "Unable to start timeshift buffer", error);
+                closeTimeshiftBuffer();
+                stateListener.onPlayerError(R.string.error_caching_stream);
+                return;
+            }
             player.setMediaSource(audioSource);
             player.prepare();
         } else {
@@ -166,9 +170,38 @@ public class ExoPlayerWrapper implements PlayerWrapper, IcyDataSource.IcyDataSou
 
         player.setPlayWhenReady(true);
 
-        context.registerReceiver(networkChangedReceiver, new IntentFilter(ConnectivityManager.CONNECTIVITY_ACTION));
+        registerNetworkReceiver();
 
         // State changed will be called when audio session id is available.
+    }
+
+    private MediaSource createTimeshiftMediaSource(TimeshiftBuffer.SeekTarget target) {
+        return new ProgressiveMediaSource.Factory(timeshiftBuffer.createDataSourceFactory(target))
+                .createMediaSource(MediaItem.fromUri(Uri.parse(streamUrl)));
+    }
+
+    private void closeTimeshiftBuffer() {
+        if (timeshiftBuffer != null) {
+            timeshiftBuffer.close();
+            timeshiftBuffer = null;
+        }
+        playbackBasePositionMs = 0;
+    }
+
+    private void registerNetworkReceiver() {
+        if (!networkReceiverRegistered) {
+            context.registerReceiver(
+                    networkChangedReceiver,
+                    new IntentFilter(ConnectivityManager.CONNECTIVITY_ACTION));
+            networkReceiverRegistered = true;
+        }
+    }
+
+    private void unregisterNetworkReceiver() {
+        if (networkReceiverRegistered) {
+            context.unregisterReceiver(networkChangedReceiver);
+            networkReceiverRegistered = false;
+        }
     }
 
     @Override
@@ -177,12 +210,13 @@ public class ExoPlayerWrapper implements PlayerWrapper, IcyDataSource.IcyDataSou
 
         cancelStopTask();
 
+        unregisterNetworkReceiver();
         if (player != null) {
-            context.unregisterReceiver(networkChangedReceiver);
             player.stop();
             player.release();
             player = null;
         }
+        closeTimeshiftBuffer();
     }
 
     @Override
@@ -191,12 +225,13 @@ public class ExoPlayerWrapper implements PlayerWrapper, IcyDataSource.IcyDataSou
 
         cancelStopTask();
 
+        unregisterNetworkReceiver();
         if (player != null) {
-            context.unregisterReceiver(networkChangedReceiver);
             player.stop();
             player.release();
             player = null;
         }
+        closeTimeshiftBuffer();
 
         stopRecording();
     }
@@ -218,14 +253,21 @@ public class ExoPlayerWrapper implements PlayerWrapper, IcyDataSource.IcyDataSou
     @Override
     public long getCurrentPositionMs() {
         if (player != null) {
-            return Math.max(0, player.getCurrentPosition());
+            return Math.max(0, playbackBasePositionMs + player.getCurrentPosition());
         }
         return 0;
     }
 
     @Override
     public long getLiveEdgePositionMs() {
+        if (timeshiftBuffer != null) {
+            return Math.max(getCurrentPositionMs(), timeshiftBuffer.getLiveEdgeMs());
+        }
         if (player != null) {
+            long liveOffset = player.getCurrentLiveOffset();
+            if (liveOffset != C.TIME_UNSET) {
+                return Math.max(getCurrentPositionMs(), getCurrentPositionMs() + liveOffset);
+            }
             return Math.max(getCurrentPositionMs(), player.getBufferedPosition());
         }
         return 0;
@@ -233,11 +275,10 @@ public class ExoPlayerWrapper implements PlayerWrapper, IcyDataSource.IcyDataSou
 
     @Override
     public long getSeekableStartPositionMs() {
-        if (player == null) {
-            return 0;
+        if (timeshiftBuffer != null) {
+            return timeshiftBuffer.getSeekableStartMs();
         }
-        // Anchor the timeshift window to the live edge so scrubbing back does not shrink the range.
-        return Math.max(0, getLiveEdgePositionMs() - TIMESHIFT_BACK_BUFFER_MS);
+        return 0;
     }
 
     @Override
@@ -245,15 +286,27 @@ public class ExoPlayerWrapper implements PlayerWrapper, IcyDataSource.IcyDataSou
         if (player == null) {
             return;
         }
-        long start = getSeekableStartPositionMs();
-        long liveEdge = getLiveEdgePositionMs();
-        long clamped = Math.max(start, Math.min(positionMs, liveEdge));
-        player.seekTo(clamped);
+
+        if (timeshiftBuffer != null) {
+            TimeshiftBuffer.SeekTarget target = timeshiftBuffer.resolveSeekTarget(positionMs);
+            playbackBasePositionMs = target.timeMs;
+            audioSource = createTimeshiftMediaSource(target);
+            stateListener.onStateChanged(PlayState.PrePlaying);
+            player.setMediaSource(audioSource);
+            player.prepare();
+            player.setPlayWhenReady(true);
+        } else if (player.isCurrentMediaItemSeekable()) {
+            long start = getSeekableStartPositionMs();
+            long liveEdge = getLiveEdgePositionMs();
+            player.seekTo(Math.max(start, Math.min(positionMs, liveEdge)));
+        }
     }
 
     @Override
     public boolean canSeek() {
-        return player != null;
+        return player != null
+                && ((timeshiftBuffer != null && timeshiftBuffer.hasSeekableAudio())
+                || (timeshiftBuffer == null && player.isCurrentMediaItemSeekable()));
     }
 
     @Override
@@ -436,12 +489,14 @@ public class ExoPlayerWrapper implements PlayerWrapper, IcyDataSource.IcyDataSou
 
     @Override
     public void onPlayerErrorChanged(PlaybackException error) {
-        Log.d(TAG, "Player error: ", error);
-        // Stop playing since it is either irrecoverable error in the player or our data source failed to reconnect.
-        if (fullStopTask != null) {
-            stop();
-            stateListener.onPlayerError(R.string.error_play_stream);
+        if (error == null) {
+            return;
         }
+        Log.d(TAG, "Player error: ", error);
+        // Stop playback for irrecoverable decoder/data-source errors instead of leaving the UI
+        // stuck in a buffering state.
+        stop();
+        stateListener.onPlayerError(R.string.error_play_stream);
     }
 
     @Override
