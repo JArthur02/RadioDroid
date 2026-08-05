@@ -402,7 +402,9 @@ final class TimeshiftBuffer {
                 recorderThread = null;
                 monitor.notifyAll();
             }
-            deleteSessionFiles();
+            // Do not delete segment files here: ExoPlayer may still be reading behind writePosition
+            // until stop()/close() runs on the main thread after irrecoverable failure.
+            // close() always deletes the session files.
         }
     }
 
@@ -714,10 +716,8 @@ final class TimeshiftBuffer {
             } catch (InterruptedException interrupted) {
                 Thread.currentThread().interrupt();
             }
-            return;
         }
 
-        // No recorder thread (unit-test ingest path): release files here.
         synchronized (monitor) {
             closeWriter();
         }

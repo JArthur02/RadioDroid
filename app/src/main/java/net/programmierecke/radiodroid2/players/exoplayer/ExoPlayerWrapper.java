@@ -421,14 +421,18 @@ public class ExoPlayerWrapper implements PlayerWrapper, IcyDataSource.IcyDataSou
             SharedPreferences sharedPref = PreferenceManager.getDefaultSharedPreferences(context);
             int resumeWithin = sharedPref.getInt("settings_resume_within", 60);
             if (resumeWithin > 0) {
+                // Already armed for this outage — avoid resetting the deadline or re-toasting on
+                // every recorder retry (default delay can be 100ms).
+                if (fullStopTask != null) {
+                    return;
+                }
+
                 Log.d(TAG, "Trying to resume playback within " + resumeWithin + "s.");
 
                 // We want user to be able to paused during connection loss.
                 // TODO: Find a way to notify user that even if current state is Playing
                 //       we are actually trying to reconnect.
                 //stateListener.onStateChanged(PlayState.Paused);
-
-                cancelStopTask();
 
                 fullStopTask = () -> {
                     stop();
