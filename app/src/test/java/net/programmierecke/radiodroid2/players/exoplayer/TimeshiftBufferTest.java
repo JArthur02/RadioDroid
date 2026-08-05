@@ -152,6 +152,53 @@ public class TimeshiftBufferTest {
         assertFalse(buffer.getLiveEdgeMs() > TimeshiftBuffer.WINDOW_DURATION_MS);
     }
 
+    @Test
+    public void bitrateArrivalRecalibratesTimelineFromBytes() throws Exception {
+        // Ingest without bitrate — seek clock must stay at zero (no wall-clock skew).
+        byte[] audio = new byte[5 * BYTES_PER_SECOND];
+        buffer.ingestForTest(audio, /* bitrate= */ 0);
+        assertEquals(0, buffer.getLiveEdgeMs());
+        assertFalse(buffer.hasSeekableAudio());
+
+        buffer.applyBitrateForTest(BITRATE_KBPS);
+        assertEquals(5000, buffer.getLiveEdgeMs());
+        assertTrue(buffer.hasSeekableAudio());
+
+        TimeshiftBuffer.SeekTarget mid = buffer.resolveSeekTarget(1000);
+        assertEquals(1000, mid.timeMs);
+        assertEquals(BYTES_PER_SECOND, mid.bytePosition);
+    }
+
+    @Test
+    public void activeReaderBlocksEvictionOfNeededSegment() throws Exception {
+        buffer.setSegmentSizeForTest(8_000);
+        buffer.setWindowForTest(/* windowMs= */ 500, /* marginMs= */ 0);
+
+        byte[] chunk = new byte[8_000];
+        Arrays.fill(chunk, (byte) 0x42);
+        // One segment (~500 ms). Register a reader before aging the window further.
+        buffer.ingestForTest(chunk, BITRATE_KBPS);
+        assertEquals(1, buffer.getSegmentCountForTest());
+
+        DataSource.Factory factory = buffer.createDataSourceFactory(new TimeshiftBuffer.SeekTarget(0, 0));
+        DataSource dataSource = factory.createDataSource();
+        dataSource.open(new DataSpec(android.net.Uri.parse("http://example.invalid/stream")));
+        try {
+            byte[] sink = new byte[64];
+            assertTrue(dataSource.read(sink, 0, sink.length) > 0);
+
+            // Without reader protection these appends would evict segment 0 (window=500ms).
+            for (int i = 0; i < 4; i++) {
+                buffer.appendForTest(chunk);
+            }
+            assertTrue("segment still needed by active reader", buffer.segmentFileExistsForTest(0));
+            assertTrue(buffer.getSegmentCountForTest() >= 2);
+            assertTrue(dataSource.read(sink, 0, sink.length) > 0);
+        } finally {
+            dataSource.close();
+        }
+    }
+
     private static final class NoOpListener implements IcyDataSource.IcyDataSourceListener {
         @Override
         public void onDataSourceConnected() {

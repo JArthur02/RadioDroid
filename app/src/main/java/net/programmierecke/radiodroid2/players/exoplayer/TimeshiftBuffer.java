@@ -29,7 +29,8 @@ import okhttp3.OkHttpClient;
  * <p>The network recorder is independent from ExoPlayer. ExoPlayer reads the audio-only bytes
  * through a {@link DataSource}, so reopening the source at an older byte position does not make a
  * second request to a live server. Files are segmented and old segments are evicted after the
- * two-hour seek window plus a small safety margin.</p>
+ * two-hour seek window plus a small safety margin, but never while an active reader still needs
+ * them.</p>
  */
 final class TimeshiftBuffer {
     static final long WINDOW_DURATION_MS = 2L * 60L * 60L * 1000L;
@@ -55,7 +56,7 @@ final class TimeshiftBuffer {
     private static final class Segment {
         final File file;
         final long startPosition;
-        final long startTimeMs;
+        long startTimeMs;
         long endPosition;
 
         Segment(File file, long startPosition, long startTimeMs) {
@@ -73,18 +74,6 @@ final class TimeshiftBuffer {
         Checkpoint(long bytePosition, long timeMs) {
             this.bytePosition = bytePosition;
             this.timeMs = timeMs;
-        }
-    }
-
-    private static final class ReadWindow {
-        final File file;
-        final long fileOffset;
-        final int length;
-
-        ReadWindow(File file, long fileOffset, int length) {
-            this.file = file;
-            this.fileOffset = fileOffset;
-            this.length = length;
         }
     }
 
@@ -107,10 +96,12 @@ final class TimeshiftBuffer {
     private final TransferListener transferListener;
     private final IcyDataSource.IcyDataSourceListener downstreamListener;
     private final int retryTimeoutMs;
+    private final int resumeWithinMs;
     private final int retryDelayMs;
     private final String sessionId = UUID.randomUUID().toString();
     private final List<Segment> segments = new ArrayList<>();
     private final List<Checkpoint> checkpoints = new ArrayList<>();
+    private final List<BufferDataSource> activeReaders = new ArrayList<>();
 
     private volatile boolean running;
     private volatile IcyDataSource upstream;
@@ -124,7 +115,9 @@ final class TimeshiftBuffer {
     private long lastCheckpointMs;
     private int bitrateKbps;
     private double durationRemainderMs;
-    private long fallbackStartedAtMs;
+    private long windowDurationMs = WINDOW_DURATION_MS;
+    private long retentionMarginMs = RETENTION_MARGIN_MS;
+    private long segmentSizeBytes = SEGMENT_SIZE_BYTES;
 
     TimeshiftBuffer(
             @NonNull File cacheDirectory,
@@ -134,12 +127,26 @@ final class TimeshiftBuffer {
             @NonNull IcyDataSource.IcyDataSourceListener downstreamListener,
             int retryTimeoutSeconds,
             int retryDelayMs) {
+        this(cacheDirectory, streamUrl, httpClient, transferListener, downstreamListener,
+                retryTimeoutSeconds, /* resumeWithinSeconds= */ 0, retryDelayMs);
+    }
+
+    TimeshiftBuffer(
+            @NonNull File cacheDirectory,
+            @NonNull String streamUrl,
+            @NonNull OkHttpClient httpClient,
+            @NonNull TransferListener transferListener,
+            @NonNull IcyDataSource.IcyDataSourceListener downstreamListener,
+            int retryTimeoutSeconds,
+            int resumeWithinSeconds,
+            int retryDelayMs) {
         this.directory = new File(cacheDirectory, "radio-timeshift");
         this.streamUrl = streamUrl;
         this.httpClient = httpClient;
         this.transferListener = transferListener;
         this.downstreamListener = downstreamListener;
         this.retryTimeoutMs = Math.max(0, retryTimeoutSeconds) * 1000;
+        this.resumeWithinMs = Math.max(0, resumeWithinSeconds) * 1000;
         this.retryDelayMs = Math.max(10, retryDelayMs);
     }
 
@@ -156,7 +163,7 @@ final class TimeshiftBuffer {
         resetStateForStart(/* deleteAbandoned= */ false);
         synchronized (monitor) {
             if (bitrate > 0) {
-                bitrateKbps = bitrate;
+                applyBitrateLocked(bitrate);
             }
         }
         appendAudio(audio, 0, audio.length);
@@ -174,9 +181,43 @@ final class TimeshiftBuffer {
         appendAudio(audio, 0, audio.length);
     }
 
+    void setWindowForTest(long windowMs, long marginMs) {
+        synchronized (monitor) {
+            windowDurationMs = Math.max(0, windowMs);
+            retentionMarginMs = Math.max(0, marginMs);
+        }
+    }
+
+    void setSegmentSizeForTest(long bytes) {
+        synchronized (monitor) {
+            segmentSizeBytes = Math.max(1024, bytes);
+        }
+    }
+
+    void applyBitrateForTest(int bitrate) {
+        synchronized (monitor) {
+            applyBitrateLocked(bitrate);
+        }
+    }
+
     long getWritePositionForTest() {
         synchronized (monitor) {
             return writePosition;
+        }
+    }
+
+    int getSegmentCountForTest() {
+        synchronized (monitor) {
+            return segments.size();
+        }
+    }
+
+    boolean segmentFileExistsForTest(int index) {
+        synchronized (monitor) {
+            if (index < 0 || index >= segments.size()) {
+                return false;
+            }
+            return segments.get(index).file.exists();
         }
     }
 
@@ -206,10 +247,10 @@ final class TimeshiftBuffer {
             lastCheckpointMs = 0;
             bitrateKbps = 0;
             durationRemainderMs = 0;
-            fallbackStartedAtMs = 0;
             segments.clear();
             checkpoints.clear();
             checkpoints.add(new Checkpoint(0, 0));
+            activeReaders.clear();
         }
     }
 
@@ -231,7 +272,9 @@ final class TimeshiftBuffer {
 
     boolean hasSeekableAudio() {
         synchronized (monitor) {
-            return liveEdgeMs - seekableStartMsLocked() >= 2000 && terminalError == null;
+            return bitrateKbps > 0
+                    && liveEdgeMs - seekableStartMsLocked() >= 2000
+                    && terminalError == null;
         }
     }
 
@@ -249,7 +292,7 @@ final class TimeshiftBuffer {
 
     private long seekableStartMsLocked() {
         long retainedStart = checkpoints.isEmpty() ? 0 : checkpoints.get(0).timeMs;
-        return Math.max(retainedStart, liveEdgeMs - WINDOW_DURATION_MS);
+        return Math.max(retainedStart, liveEdgeMs - windowDurationMs);
     }
 
     private long bytePositionForTimeLocked(long targetMs) {
@@ -291,6 +334,14 @@ final class TimeshiftBuffer {
         return Math.min(writePosition, position);
     }
 
+    private long reconnectBudgetMs() {
+        // Prefer the user-facing resume window; fall back to the short retry timeout.
+        if (resumeWithinMs > 0) {
+            return resumeWithinMs;
+        }
+        return retryTimeoutMs;
+    }
+
     private void recordLoop() {
         byte[] networkBuffer = new byte[32 * 1024];
         long firstFailureAt = 0;
@@ -322,8 +373,9 @@ final class TimeshiftBuffer {
                     if (firstFailureAt == 0) {
                         firstFailureAt = System.currentTimeMillis();
                     }
-                    if (retryTimeoutMs == 0
-                            || System.currentTimeMillis() - firstFailureAt >= retryTimeoutMs) {
+                    long budgetMs = reconnectBudgetMs();
+                    if (budgetMs == 0
+                            || System.currentTimeMillis() - firstFailureAt >= budgetMs) {
                         fail(error);
                         downstreamListener.onDataSourceConnectionLostIrrecoverably();
                         break;
@@ -374,7 +426,7 @@ final class TimeshiftBuffer {
         public void onDataSourceShoutcastInfo(ShoutcastInfo shoutcastInfo) {
             if (shoutcastInfo != null && shoutcastInfo.bitrate > 0) {
                 synchronized (monitor) {
-                    bitrateKbps = shoutcastInfo.bitrate;
+                    applyBitrateLocked(shoutcastInfo.bitrate);
                 }
             }
             downstreamListener.onDataSourceShoutcastInfo(shoutcastInfo);
@@ -401,6 +453,34 @@ final class TimeshiftBuffer {
         }
     }
 
+    private void applyBitrateLocked(int bitrate) {
+        if (bitrate <= 0) {
+            return;
+        }
+        boolean firstBitrate = bitrateKbps <= 0;
+        bitrateKbps = bitrate;
+        if (firstBitrate && writePosition > 0) {
+            recalibrateTimelineFromBytesLocked();
+        }
+    }
+
+    private void recalibrateTimelineFromBytesLocked() {
+        double exactMs = (writePosition * 8.0) / bitrateKbps;
+        liveEdgeMs = (long) exactMs;
+        durationRemainderMs = exactMs - liveEdgeMs;
+        checkpoints.clear();
+        checkpoints.add(new Checkpoint(0, 0));
+        if (liveEdgeMs > 0) {
+            checkpoints.add(new Checkpoint(writePosition, liveEdgeMs));
+            lastCheckpointMs = liveEdgeMs;
+        } else {
+            lastCheckpointMs = 0;
+        }
+        for (Segment segment : segments) {
+            segment.startTimeMs = (long) ((segment.startPosition * 8.0) / bitrateKbps);
+        }
+    }
+
     private void appendAudio(byte[] data, int offset, int length) throws IOException {
         int remaining = length;
         int sourceOffset = offset;
@@ -412,7 +492,7 @@ final class TimeshiftBuffer {
                 }
                 ensureWriter();
                 long segmentBytes = currentSegment.endPosition - currentSegment.startPosition;
-                long remainingCapacity = SEGMENT_SIZE_BYTES - segmentBytes;
+                long remainingCapacity = segmentSizeBytes - segmentBytes;
                 if (remainingCapacity <= 0) {
                     closeWriter();
                     continue;
@@ -438,7 +518,7 @@ final class TimeshiftBuffer {
                     checkpoints.add(new Checkpoint(writePosition, liveEdgeMs));
                     lastCheckpointMs = liveEdgeMs;
                 }
-                if (currentSegment.endPosition - currentSegment.startPosition >= SEGMENT_SIZE_BYTES) {
+                if (currentSegment.endPosition - currentSegment.startPosition >= segmentSizeBytes) {
                     closeWriter();
                 }
                 evictExpiredSegments();
@@ -448,17 +528,15 @@ final class TimeshiftBuffer {
     }
 
     private void updateDuration(int audioBytes) {
-        if (bitrateKbps > 0) {
-            double elapsedMs = (audioBytes * 8.0) / bitrateKbps + durationRemainderMs;
-            long wholeMs = (long) elapsedMs;
-            durationRemainderMs = elapsedMs - wholeMs;
-            liveEdgeMs += wholeMs;
-        } else {
-            if (fallbackStartedAtMs == 0) {
-                fallbackStartedAtMs = System.currentTimeMillis();
-            }
-            liveEdgeMs = Math.max(liveEdgeMs, System.currentTimeMillis() - fallbackStartedAtMs);
+        if (bitrateKbps <= 0) {
+            // Do not advance the seek clock from wall time: that desyncs byte↔time mapping once
+            // Shoutcast bitrate arrives. Seeking stays disabled until bitrate is known.
+            return;
         }
+        double elapsedMs = (audioBytes * 8.0) / bitrateKbps + durationRemainderMs;
+        long wholeMs = (long) elapsedMs;
+        durationRemainderMs = elapsedMs - wholeMs;
+        liveEdgeMs += wholeMs;
     }
 
     private void ensureWriter() throws IOException {
@@ -485,12 +563,25 @@ final class TimeshiftBuffer {
         }
     }
 
+    private long earliestActiveReadPositionLocked() {
+        long earliest = Long.MAX_VALUE;
+        for (BufferDataSource reader : activeReaders) {
+            earliest = Math.min(earliest, reader.getReadPosition());
+        }
+        return earliest;
+    }
+
     private void evictExpiredSegments() {
-        long cutoffMs = liveEdgeMs - WINDOW_DURATION_MS - RETENTION_MARGIN_MS;
+        long cutoffMs = liveEdgeMs - windowDurationMs - retentionMarginMs;
+        long protectedPosition = earliestActiveReadPositionLocked();
+
         while (segments.size() > 1 && segments.get(1).startTimeMs <= cutoffMs) {
+            Segment candidate = segments.get(0);
+            // Keep any segment still needed by an active ExoPlayer DataSource.
+            if (protectedPosition < candidate.endPosition) {
+                break;
+            }
             Segment expired = segments.remove(0);
-            // A DataSource that already opened the file can continue reading its file descriptor.
-            // New seeks are clamped to the first retained checkpoint.
             //noinspection ResultOfMethodCallIgnored
             expired.file.delete();
         }
@@ -509,8 +600,23 @@ final class TimeshiftBuffer {
         }
     }
 
+    private void registerReader(BufferDataSource reader) {
+        synchronized (monitor) {
+            activeReaders.add(reader);
+        }
+    }
+
+    private void unregisterReader(BufferDataSource reader) {
+        synchronized (monitor) {
+            activeReaders.remove(reader);
+            // Readers leaving may unblock eviction of segments past the window.
+            evictExpiredSegments();
+        }
+    }
+
     private int read(long position, byte[] buffer, int offset, int length) throws IOException {
-        ReadWindow window;
+        RandomAccessFile reader;
+        int available;
         synchronized (monitor) {
             while (position >= writePosition && running && terminalError == null) {
                 try {
@@ -533,16 +639,31 @@ final class TimeshiftBuffer {
                 throw new IOException("Requested timeshift position is no longer buffered");
             }
 
-            int available = (int) Math.min(length, segment.endPosition - position);
+            available = (int) Math.min(length, segment.endPosition - position);
             if (available <= 0) {
                 return 0;
             }
-            window = new ReadWindow(segment.file, position - segment.startPosition, available);
+            // Open under the monitor so eviction cannot delete the file between lookup and open.
+            // On Linux the inode stays readable via this FD even if later unlinked.
+            reader = new RandomAccessFile(segment.file, "r");
+            try {
+                reader.seek(position - segment.startPosition);
+            } catch (IOException error) {
+                try {
+                    reader.close();
+                } catch (IOException ignored) {
+                }
+                throw error;
+            }
         }
 
-        try (RandomAccessFile reader = new RandomAccessFile(window.file, "r")) {
-            reader.seek(window.fileOffset);
-            return reader.read(buffer, offset, window.length);
+        try {
+            return reader.read(buffer, offset, available);
+        } finally {
+            try {
+                reader.close();
+            } catch (IOException ignored) {
+            }
         }
     }
 
@@ -623,6 +744,7 @@ final class TimeshiftBuffer {
             }
             segments.clear();
             checkpoints.clear();
+            activeReaders.clear();
         }
     }
 
@@ -631,16 +753,26 @@ final class TimeshiftBuffer {
         private final Uri uri;
         private final long basePosition;
         private long readPosition;
+        private boolean opened;
 
         BufferDataSource(TimeshiftBuffer owner, String streamUrl, long basePosition) {
             this.owner = owner;
             this.uri = Uri.parse(streamUrl);
             this.basePosition = basePosition;
+            this.readPosition = basePosition;
+        }
+
+        long getReadPosition() {
+            return readPosition;
         }
 
         @Override
         public long open(DataSpec dataSpec) {
             readPosition = basePosition + Math.max(0, dataSpec.position);
+            if (!opened) {
+                owner.registerReader(this);
+                opened = true;
+            }
             return C.LENGTH_UNSET;
         }
 
@@ -663,6 +795,10 @@ final class TimeshiftBuffer {
 
         @Override
         public void close() {
+            if (opened) {
+                opened = false;
+                owner.unregisterReader(this);
+            }
         }
 
         @Override

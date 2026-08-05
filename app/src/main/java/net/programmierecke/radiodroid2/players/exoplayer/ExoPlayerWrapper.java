@@ -136,6 +136,7 @@ public class ExoPlayerWrapper implements PlayerWrapper, IcyDataSource.IcyDataSou
         SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(context.getApplicationContext());
         final int retryTimeout = prefs.getInt("settings_retry_timeout", 10);
         final int retryDelay = prefs.getInt("settings_retry_delay", 100);
+        final int resumeWithin = prefs.getInt("settings_resume_within", 60);
 
         DataSource.Factory dataSourceFactory = new RadioDataSourceFactory(httpClient, bandwidthMeter, this, retryTimeout, retryDelay);
         // Produces Extractor instances for parsing the media data.
@@ -148,6 +149,7 @@ public class ExoPlayerWrapper implements PlayerWrapper, IcyDataSource.IcyDataSou
                         bandwidthMeter,
                         this,
                         retryTimeout,
+                        resumeWithin,
                         retryDelay);
                 timeshiftBuffer.start();
                 TimeshiftBuffer.SeekTarget initialTarget = timeshiftBuffer.resolveSeekTarget(0);
@@ -185,6 +187,7 @@ public class ExoPlayerWrapper implements PlayerWrapper, IcyDataSource.IcyDataSou
         return new ProgressiveMediaSource.Factory(
                 timeshiftBuffer.createDataSourceFactory(target),
                 extractorsFactory)
+                .setLoadErrorHandlingPolicy(new CustomLoadErrorHandlingPolicy())
                 .createMediaSource(MediaItem.fromUri(Uri.parse(streamUrl)));
     }
 
@@ -354,12 +357,16 @@ public class ExoPlayerWrapper implements PlayerWrapper, IcyDataSource.IcyDataSou
 
     @Override
     public void onDataSourceConnected() {
-
+        // Recorder reconnected (or first connect). Drop any pending "give up resume" stop.
+        cancelStopTask();
     }
 
     @Override
     public void onDataSourceConnectionLost() {
-
+        // Timeshift keeps playing from disk while the recorder retries; warn and arm resume window.
+        if (timeshiftBuffer != null) {
+            resumeWhenNetworkConnected();
+        }
     }
 
     @Override
@@ -397,6 +404,16 @@ public class ExoPlayerWrapper implements PlayerWrapper, IcyDataSource.IcyDataSou
     @Override
     public void onDataSourceConnectionLostIrrecoverably() {
         Log.i(TAG, "Connection lost irrecoverably.");
+        if (playerThreadHandler == null) {
+            return;
+        }
+        playerThreadHandler.post(() -> {
+            cancelStopTask();
+            stop();
+            if (stateListener != null) {
+                stateListener.onPlayerError(R.string.error_stream_reconnect_timeout);
+            }
+        });
     }
 
     void resumeWhenNetworkConnected() {
