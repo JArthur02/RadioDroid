@@ -28,6 +28,7 @@ import com.google.android.exoplayer2.metadata.Metadata;
 import com.google.android.exoplayer2.metadata.icy.IcyHeaders;
 import com.google.android.exoplayer2.metadata.icy.IcyInfo;
 import com.google.android.exoplayer2.metadata.id3.Id3Frame;
+import com.google.android.exoplayer2.extractor.DefaultExtractorsFactory;
 import com.google.android.exoplayer2.source.MediaSource;
 import com.google.android.exoplayer2.source.ProgressiveMediaSource;
 import com.google.android.exoplayer2.source.hls.HlsMediaSource;
@@ -176,7 +177,14 @@ public class ExoPlayerWrapper implements PlayerWrapper, IcyDataSource.IcyDataSou
     }
 
     private MediaSource createTimeshiftMediaSource(TimeshiftBuffer.SeekTarget target) {
-        return new ProgressiveMediaSource.Factory(timeshiftBuffer.createDataSourceFactory(target))
+        // Mid-buffer seeks open the rolling file at an arbitrary byte offset. Enable CBR seeking so
+        // MP3/AAC extractors can resynchronize without scanning from the session start.
+        DefaultExtractorsFactory extractorsFactory = new DefaultExtractorsFactory()
+                .setConstantBitrateSeekingEnabled(true)
+                .setConstantBitrateSeekingAlwaysEnabled(true);
+        return new ProgressiveMediaSource.Factory(
+                timeshiftBuffer.createDataSourceFactory(target),
+                extractorsFactory)
                 .createMediaSource(MediaItem.fromUri(Uri.parse(streamUrl)));
     }
 

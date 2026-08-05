@@ -3,6 +3,7 @@ package net.programmierecke.radiodroid2.players.exoplayer;
 import android.net.Uri;
 
 import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
 
 import com.google.android.exoplayer2.C;
 import com.google.android.exoplayer2.upstream.DataSource;
@@ -32,12 +33,13 @@ import okhttp3.OkHttpClient;
  */
 final class TimeshiftBuffer {
     static final long WINDOW_DURATION_MS = 2L * 60L * 60L * 1000L;
+    static final long LIVE_START_MARGIN_MS = 1500L;
 
     private static final long RETENTION_MARGIN_MS = 5L * 60L * 1000L;
     private static final long SEGMENT_SIZE_BYTES = 1024L * 1024L;
     private static final long CHECKPOINT_INTERVAL_MS = 1000L;
-    private static final long LIVE_START_MARGIN_MS = 1500L;
     private static final int READ_WAIT_MS = 500;
+    private static final long RECORDER_JOIN_TIMEOUT_MS = 5000L;
     private static final String FILE_PREFIX = "radiodroid-timeshift-";
 
     static final class SeekTarget {
@@ -71,6 +73,30 @@ final class TimeshiftBuffer {
         Checkpoint(long bytePosition, long timeMs) {
             this.bytePosition = bytePosition;
             this.timeMs = timeMs;
+        }
+    }
+
+    private static final class ReadWindow {
+        final File file;
+        final long fileOffset;
+        final int length;
+
+        ReadWindow(File file, long fileOffset, int length) {
+            this.file = file;
+            this.fileOffset = fileOffset;
+            this.length = length;
+        }
+    }
+
+    private static final class WriteWindow {
+        final RandomAccessFile writer;
+        final Segment segment;
+        final int length;
+
+        WriteWindow(RandomAccessFile writer, Segment segment, int length) {
+            this.writer = writer;
+            this.segment = segment;
+            this.length = length;
         }
     }
 
@@ -118,20 +144,73 @@ final class TimeshiftBuffer {
     }
 
     void start() throws IOException {
+        resetStateForStart(/* deleteAbandoned= */ true);
+        recorderThread = new Thread(this::recordLoop, "RadioTimeshiftRecorder");
+        recorderThread.start();
+    }
+
+    /**
+     * Test helper: ingest audio without opening a network connection.
+     */
+    void ingestForTest(@NonNull byte[] audio, int bitrate) throws IOException {
+        resetStateForStart(/* deleteAbandoned= */ false);
         synchronized (monitor) {
+            if (bitrate > 0) {
+                bitrateKbps = bitrate;
+            }
+        }
+        appendAudio(audio, 0, audio.length);
+    }
+
+    /**
+     * Test helper: append more audio to an already-started test buffer.
+     */
+    void appendForTest(@NonNull byte[] audio) throws IOException {
+        synchronized (monitor) {
+            if (!running) {
+                throw new IOException("Timeshift buffer is not running");
+            }
+        }
+        appendAudio(audio, 0, audio.length);
+    }
+
+    long getWritePositionForTest() {
+        synchronized (monitor) {
+            return writePosition;
+        }
+    }
+
+    int readForTest(long position, byte[] buffer, int offset, int length) throws IOException {
+        return read(position, buffer, offset, length);
+    }
+
+    private void resetStateForStart(boolean deleteAbandoned) throws IOException {
+        synchronized (monitor) {
+            if (running && recorderThread != null) {
+                throw new IOException("Timeshift buffer already running");
+            }
             if (running) {
-                return;
+                // Previous test ingest left the buffer open without a recorder thread.
+                closeWriter();
             }
             if (!directory.exists() && !directory.mkdirs()) {
                 throw new IOException("Could not create timeshift cache directory");
             }
-            deleteAbandonedSessions();
+            if (deleteAbandoned) {
+                deleteAbandonedSessions();
+            }
             running = true;
+            terminalError = null;
+            writePosition = 0;
+            liveEdgeMs = 0;
+            lastCheckpointMs = 0;
+            bitrateKbps = 0;
+            durationRemainderMs = 0;
+            fallbackStartedAtMs = 0;
+            segments.clear();
+            checkpoints.clear();
             checkpoints.add(new Checkpoint(0, 0));
         }
-
-        recorderThread = new Thread(this::recordLoop, "RadioTimeshiftRecorder");
-        recorderThread.start();
     }
 
     DataSource.Factory createDataSourceFactory(SeekTarget target) {
@@ -146,43 +225,70 @@ final class TimeshiftBuffer {
 
     long getSeekableStartMs() {
         synchronized (monitor) {
-            long retainedStart = checkpoints.isEmpty() ? 0 : checkpoints.get(0).timeMs;
-            return Math.max(retainedStart, liveEdgeMs - WINDOW_DURATION_MS);
+            return seekableStartMsLocked();
         }
     }
 
     boolean hasSeekableAudio() {
         synchronized (monitor) {
-            return liveEdgeMs - getSeekableStartMs() >= 2000 && terminalError == null;
+            return liveEdgeMs - seekableStartMsLocked() >= 2000 && terminalError == null;
         }
     }
 
     SeekTarget resolveSeekTarget(long requestedTimeMs) {
         synchronized (monitor) {
-            long startMs = getSeekableStartMs();
+            long startMs = seekableStartMsLocked();
             long targetMs = Math.max(startMs, Math.min(requestedTimeMs, liveEdgeMs));
             if (liveEdgeMs - targetMs < LIVE_START_MARGIN_MS) {
                 targetMs = Math.max(startMs, liveEdgeMs - LIVE_START_MARGIN_MS);
             }
 
-            if (checkpoints.size() == 1) {
-                return new SeekTarget(checkpoints.get(0).bytePosition, targetMs);
-            }
-
-            Checkpoint previous = checkpoints.get(0);
-            for (int i = 1; i < checkpoints.size(); i++) {
-                Checkpoint next = checkpoints.get(i);
-                if (next.timeMs >= targetMs) {
-                    long timeSpan = Math.max(1, next.timeMs - previous.timeMs);
-                    long byteSpan = next.bytePosition - previous.bytePosition;
-                    long offset = (targetMs - previous.timeMs) * byteSpan / timeSpan;
-                    return new SeekTarget(previous.bytePosition + offset, targetMs);
-                }
-                previous = next;
-            }
-
-            return new SeekTarget(writePosition, targetMs);
+            return new SeekTarget(bytePositionForTimeLocked(targetMs), targetMs);
         }
+    }
+
+    private long seekableStartMsLocked() {
+        long retainedStart = checkpoints.isEmpty() ? 0 : checkpoints.get(0).timeMs;
+        return Math.max(retainedStart, liveEdgeMs - WINDOW_DURATION_MS);
+    }
+
+    private long bytePositionForTimeLocked(long targetMs) {
+        if (targetMs <= 0 || writePosition <= 0 || liveEdgeMs <= 0) {
+            return 0;
+        }
+        if (targetMs >= liveEdgeMs) {
+            return writePosition;
+        }
+
+        Checkpoint previous = checkpoints.get(0);
+        for (int i = 1; i < checkpoints.size(); i++) {
+            Checkpoint next = checkpoints.get(i);
+            if (next.timeMs >= targetMs) {
+                return interpolateLocked(previous.bytePosition, previous.timeMs,
+                        next.bytePosition, next.timeMs, targetMs);
+            }
+            previous = next;
+        }
+
+        // Between the last checkpoint and the live tip (or only the zero checkpoint).
+        return interpolateLocked(previous.bytePosition, previous.timeMs,
+                writePosition, liveEdgeMs, targetMs);
+    }
+
+    private long interpolateLocked(
+            long startBytes,
+            long startMs,
+            long endBytes,
+            long endMs,
+            long targetMs) {
+        long timeSpan = Math.max(1, endMs - startMs);
+        long byteSpan = endBytes - startBytes;
+        long offset = (targetMs - startMs) * byteSpan / timeSpan;
+        long position = startBytes + offset;
+        if (position < 0) {
+            return 0;
+        }
+        return Math.min(writePosition, position);
     }
 
     private void recordLoop() {
@@ -241,6 +347,7 @@ final class TimeshiftBuffer {
             synchronized (monitor) {
                 closeWriter();
                 running = false;
+                recorderThread = null;
                 monitor.notifyAll();
             }
             deleteSessionFiles();
@@ -295,31 +402,48 @@ final class TimeshiftBuffer {
     }
 
     private void appendAudio(byte[] data, int offset, int length) throws IOException {
-        synchronized (monitor) {
-            int remaining = length;
-            int sourceOffset = offset;
-            while (remaining > 0) {
+        int remaining = length;
+        int sourceOffset = offset;
+        while (remaining > 0) {
+            WriteWindow window;
+            synchronized (monitor) {
+                if (!running) {
+                    return;
+                }
                 ensureWriter();
                 long segmentBytes = currentSegment.endPosition - currentSegment.startPosition;
-                int writable = (int) Math.min(remaining, SEGMENT_SIZE_BYTES - segmentBytes);
-                segmentWriter.write(data, sourceOffset, writable);
-                currentSegment.endPosition += writable;
-                writePosition += writable;
-                sourceOffset += writable;
-                remaining -= writable;
+                long remainingCapacity = SEGMENT_SIZE_BYTES - segmentBytes;
+                if (remainingCapacity <= 0) {
+                    closeWriter();
+                    continue;
+                }
+                int writable = (int) Math.min(remaining, remainingCapacity);
+                window = new WriteWindow(segmentWriter, currentSegment, writable);
+            }
 
+            // Disk I/O outside the monitor so readers can map windows concurrently.
+            window.writer.write(data, sourceOffset, window.length);
+
+            synchronized (monitor) {
+                if (window.segment != currentSegment || segmentWriter != window.writer) {
+                    throw new IOException("Timeshift segment changed during write");
+                }
+                currentSegment.endPosition += window.length;
+                writePosition += window.length;
+                sourceOffset += window.length;
+                remaining -= window.length;
+
+                updateDuration(window.length);
+                if (liveEdgeMs - lastCheckpointMs >= CHECKPOINT_INTERVAL_MS) {
+                    checkpoints.add(new Checkpoint(writePosition, liveEdgeMs));
+                    lastCheckpointMs = liveEdgeMs;
+                }
                 if (currentSegment.endPosition - currentSegment.startPosition >= SEGMENT_SIZE_BYTES) {
                     closeWriter();
                 }
+                evictExpiredSegments();
+                monitor.notifyAll();
             }
-
-            updateDuration(length);
-            if (liveEdgeMs - lastCheckpointMs >= CHECKPOINT_INTERVAL_MS) {
-                checkpoints.add(new Checkpoint(writePosition, liveEdgeMs));
-                lastCheckpointMs = liveEdgeMs;
-            }
-            evictExpiredSegments();
-            monitor.notifyAll();
         }
     }
 
@@ -386,6 +510,7 @@ final class TimeshiftBuffer {
     }
 
     private int read(long position, byte[] buffer, int offset, int length) throws IOException {
+        ReadWindow window;
         synchronized (monitor) {
             while (position >= writePosition && running && terminalError == null) {
                 try {
@@ -409,13 +534,19 @@ final class TimeshiftBuffer {
             }
 
             int available = (int) Math.min(length, segment.endPosition - position);
-            try (RandomAccessFile reader = new RandomAccessFile(segment.file, "r")) {
-                reader.seek(position - segment.startPosition);
-                return reader.read(buffer, offset, available);
+            if (available <= 0) {
+                return 0;
             }
+            window = new ReadWindow(segment.file, position - segment.startPosition, available);
+        }
+
+        try (RandomAccessFile reader = new RandomAccessFile(window.file, "r")) {
+            reader.seek(window.fileOffset);
+            return reader.read(buffer, offset, window.length);
         }
     }
 
+    @Nullable
     private Segment findSegment(long position) {
         for (Segment segment : segments) {
             if (position >= segment.startPosition && position < segment.endPosition) {
@@ -441,8 +572,10 @@ final class TimeshiftBuffer {
     }
 
     public void close() {
+        Thread recorder;
         synchronized (monitor) {
             running = false;
+            recorder = recorderThread;
             monitor.notifyAll();
         }
 
@@ -453,9 +586,21 @@ final class TimeshiftBuffer {
             } catch (IOException ignored) {
             }
         }
-        if (recorderThread != null) {
-            recorderThread.interrupt();
+        if (recorder != null) {
+            recorder.interrupt();
+            try {
+                recorder.join(RECORDER_JOIN_TIMEOUT_MS);
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+            }
+            return;
         }
+
+        // No recorder thread (unit-test ingest path): release files here.
+        synchronized (monitor) {
+            closeWriter();
+        }
+        deleteSessionFiles();
     }
 
     private void deleteAbandonedSessions() {
@@ -495,7 +640,7 @@ final class TimeshiftBuffer {
 
         @Override
         public long open(DataSpec dataSpec) {
-            readPosition = basePosition + dataSpec.position;
+            readPosition = basePosition + Math.max(0, dataSpec.position);
             return C.LENGTH_UNSET;
         }
 
