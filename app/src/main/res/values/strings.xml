@@ -258,6 +258,8 @@
     <string name="player_info_transferred">Transferred data: %1$s</string>
     <string name="player_info_recording_to">Recording to:\n%1$s</string>
     <string name="player_info_recorded_to">Last recording:\n%1$s</string>
+    <string name="player_live">LIVE</string>
+    <string name="description_playhead">Playback position</string>
 
     <string name="tab_player_art">Album art</string>
     <string name="tab_player_info">Info</string>

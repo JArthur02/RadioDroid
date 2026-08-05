@@ -393,6 +393,60 @@ public class PlayerServiceUtil {
         return 0;
     }
 
+    public static long getCurrentPositionMs() {
+        if (itsPlayerService != null) {
+            try {
+                return itsPlayerService.getCurrentPositionMs();
+            } catch (RemoteException e) {
+                Log.e("", "" + e);
+            }
+        }
+        return 0;
+    }
+
+    public static long getLiveEdgePositionMs() {
+        if (itsPlayerService != null) {
+            try {
+                return itsPlayerService.getLiveEdgePositionMs();
+            } catch (RemoteException e) {
+                Log.e("", "" + e);
+            }
+        }
+        return 0;
+    }
+
+    public static long getSeekableStartPositionMs() {
+        if (itsPlayerService != null) {
+            try {
+                return itsPlayerService.getSeekableStartPositionMs();
+            } catch (RemoteException e) {
+                Log.e("", "" + e);
+            }
+        }
+        return 0;
+    }
+
+    public static void seekTo(long positionMs) {
+        if (itsPlayerService != null) {
+            try {
+                itsPlayerService.seekTo(positionMs);
+            } catch (RemoteException e) {
+                Log.e("", "" + e);
+            }
+        }
+    }
+
+    public static boolean canSeek() {
+        if (itsPlayerService != null) {
+            try {
+                return itsPlayerService.canSeek();
+            } catch (RemoteException e) {
+                Log.e("", "" + e);
+            }
+        }
+        return false;
+    }
+
     public static long getLastPlayStartTime() {
         if (itsPlayerService != null) {
             try {

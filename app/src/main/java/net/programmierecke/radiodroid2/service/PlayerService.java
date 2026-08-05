@@ -308,6 +308,42 @@ public class PlayerService extends JobIntentService implements RadioPlayer.Playe
         }
 
         @Override
+        public long getCurrentPositionMs() throws RemoteException {
+            if (radioPlayer != null) {
+                return radioPlayer.getCurrentPositionMs();
+            }
+            return 0;
+        }
+
+        @Override
+        public long getLiveEdgePositionMs() throws RemoteException {
+            if (radioPlayer != null) {
+                return radioPlayer.getLiveEdgePositionMs();
+            }
+            return 0;
+        }
+
+        @Override
+        public long getSeekableStartPositionMs() throws RemoteException {
+            if (radioPlayer != null) {
+                return radioPlayer.getSeekableStartPositionMs();
+            }
+            return 0;
+        }
+
+        @Override
+        public void seekTo(long positionMs) throws RemoteException {
+            if (radioPlayer != null) {
+                radioPlayer.seekTo(positionMs);
+            }
+        }
+
+        @Override
+        public boolean canSeek() throws RemoteException {
+            return radioPlayer != null && radioPlayer.canSeek();
+        }
+
+        @Override
         public long getLastPlayStartTime() throws RemoteException {
             return lastPlayStartTime;
         }

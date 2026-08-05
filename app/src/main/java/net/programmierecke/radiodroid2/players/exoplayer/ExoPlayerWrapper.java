@@ -17,7 +17,9 @@ import androidx.annotation.Nullable;
 import androidx.preference.PreferenceManager;
 
 import com.google.android.exoplayer2.C;
+import com.google.android.exoplayer2.DefaultLoadControl;
 import com.google.android.exoplayer2.ExoPlayer;
+import com.google.android.exoplayer2.LoadControl;
 import com.google.android.exoplayer2.MediaItem;
 import com.google.android.exoplayer2.PlaybackException;
 import com.google.android.exoplayer2.PlaybackParameters;
@@ -54,6 +56,11 @@ import okhttp3.OkHttpClient;
 public class ExoPlayerWrapper implements PlayerWrapper, IcyDataSource.IcyDataSourceListener, Player.Listener {
 
     final private String TAG = "ExoPlayerWrapper";
+
+    /** How far back from the live edge the user can scrub (timeshift window). */
+    private static final int TIMESHIFT_BACK_BUFFER_MS = 60 * 60 * 1000; // 1 hour
+    /** Max forward buffer; slightly larger than back buffer so live edge stays ahead. */
+    private static final int TIMESHIFT_MAX_BUFFER_MS = TIMESHIFT_BACK_BUFFER_MS + 60_000;
 
     private ExoPlayer player;
     private PlayListener stateListener;
@@ -112,7 +119,18 @@ public class ExoPlayerWrapper implements PlayerWrapper, IcyDataSource.IcyDataSou
         }
 
         if (player == null) {
-            player = new ExoPlayer.Builder(context).build();
+            LoadControl loadControl = new DefaultLoadControl.Builder()
+                    .setBufferDurationsMs(
+                            DefaultLoadControl.DEFAULT_MIN_BUFFER_MS,
+                            TIMESHIFT_MAX_BUFFER_MS,
+                            DefaultLoadControl.DEFAULT_BUFFER_FOR_PLAYBACK_MS,
+                            DefaultLoadControl.DEFAULT_BUFFER_FOR_PLAYBACK_AFTER_REBUFFER_MS)
+                    .setBackBuffer(TIMESHIFT_BACK_BUFFER_MS, /* retainFromKeyframe= */ true)
+                    .build();
+
+            player = new ExoPlayer.Builder(context)
+                    .setLoadControl(loadControl)
+                    .build();
             player.setAudioAttributes(new AudioAttributes.Builder().setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
                     .setUsage(isAlarm ? C.USAGE_ALARM : C.USAGE_MEDIA).build(), false);
 
@@ -191,10 +209,51 @@ public class ExoPlayerWrapper implements PlayerWrapper, IcyDataSource.IcyDataSou
     @Override
     public long getBufferedMs() {
         if (player != null) {
-            return (int) (player.getBufferedPosition() - player.getCurrentPosition());
+            return Math.max(0, player.getBufferedPosition() - player.getCurrentPosition());
         }
 
         return 0;
+    }
+
+    @Override
+    public long getCurrentPositionMs() {
+        if (player != null) {
+            return Math.max(0, player.getCurrentPosition());
+        }
+        return 0;
+    }
+
+    @Override
+    public long getLiveEdgePositionMs() {
+        if (player != null) {
+            return Math.max(getCurrentPositionMs(), player.getBufferedPosition());
+        }
+        return 0;
+    }
+
+    @Override
+    public long getSeekableStartPositionMs() {
+        if (player == null) {
+            return 0;
+        }
+        // Anchor the timeshift window to the live edge so scrubbing back does not shrink the range.
+        return Math.max(0, getLiveEdgePositionMs() - TIMESHIFT_BACK_BUFFER_MS);
+    }
+
+    @Override
+    public void seekTo(long positionMs) {
+        if (player == null) {
+            return;
+        }
+        long start = getSeekableStartPositionMs();
+        long liveEdge = getLiveEdgePositionMs();
+        long clamped = Math.max(start, Math.min(positionMs, liveEdge));
+        player.seekTo(clamped);
+    }
+
+    @Override
+    public boolean canSeek() {
+        return player != null;
     }
 
     @Override
