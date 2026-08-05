@@ -58,7 +58,7 @@ public class ExoPlayerWrapper implements PlayerWrapper, IcyDataSource.IcyDataSou
     final private String TAG = "ExoPlayerWrapper";
 
     /** How far back from the live edge the user can scrub (timeshift window). */
-    private static final int TIMESHIFT_BACK_BUFFER_MS = 60 * 60 * 1000; // 1 hour
+    private static final int TIMESHIFT_BACK_BUFFER_MS = 2 * 60 * 60 * 1000; // 2 hours
     /** Max forward buffer; slightly larger than back buffer so live edge stays ahead. */
     private static final int TIMESHIFT_MAX_BUFFER_MS = TIMESHIFT_BACK_BUFFER_MS + 60_000;
 
