@@ -8,45 +8,100 @@
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
       font-family: system-ui, -apple-system, sans-serif;
-      background: #1a1a2e;
-      color: #eee;
-      height: 100vh;
+      background: #f4f6f8;
+      color: #1f2937;
+      min-height: 100vh;
       display: flex;
       flex-direction: column;
     }
     header {
-      padding: 12px 20px;
-      background: #16213e;
-      border-bottom: 1px solid #0f3460;
+      padding: 16px 24px;
+      background: #fff;
+      border-bottom: 1px solid #e5e7eb;
       display: flex;
       align-items: center;
       justify-content: space-between;
       gap: 16px;
-      flex-shrink: 0;
+      flex-wrap: wrap;
     }
-    header h1 {
-      font-size: 1rem;
-      font-weight: 600;
-    }
-    header a {
-      color: #e94560;
+    header h1 { font-size: 1.1rem; font-weight: 600; }
+    .actions { display: flex; gap: 10px; flex-wrap: wrap; }
+    .btn {
+      display: inline-block;
+      padding: 8px 14px;
+      border-radius: 6px;
       text-decoration: none;
       font-size: 0.875rem;
+      font-weight: 500;
     }
-    header a:hover { text-decoration: underline; }
-    iframe {
+    .btn-primary { background: #2563eb; color: #fff; }
+    .btn-secondary { background: #fff; color: #2563eb; border: 1px solid #bfdbfe; }
+    main {
       flex: 1;
-      width: 100%;
-      border: none;
+      display: grid;
+      grid-template-columns: 340px 1fr;
+      min-height: 0;
+    }
+    aside {
+      padding: 20px;
       background: #fff;
+      border-right: 1px solid #e5e7eb;
+      overflow: auto;
+    }
+    aside h2 { font-size: 0.95rem; margin-bottom: 10px; }
+    aside p, aside li { font-size: 0.875rem; line-height: 1.5; color: #4b5563; }
+    aside ol { margin: 10px 0 0 18px; }
+    aside li + li { margin-top: 8px; }
+    .notice {
+      margin-top: 16px;
+      padding: 12px;
+      background: #eff6ff;
+      border: 1px solid #bfdbfe;
+      border-radius: 8px;
+      color: #1e40af;
+      font-size: 0.85rem;
+      line-height: 1.45;
+    }
+    iframe { width: 100%; height: 100%; border: none; background: #fff; }
+    @media (max-width: 900px) {
+      main { grid-template-columns: 1fr; }
+      aside { border-right: none; border-bottom: 1px solid #e5e7eb; }
+      iframe { min-height: 70vh; }
     }
   </style>
 </head>
 <body>
   <header>
     <h1>AS 1391-2020 — Tensile Test</h1>
-    <a href="AS_1391-2020-tensile-test.pdf" download>Download PDF</a>
+    <div class="actions">
+      <a class="btn btn-primary" href="AS_1391-2020-tensile-test-flattened.pdf" download>Download browser PDF</a>
+      <a class="btn btn-secondary" href="AS_1391-2020-tensile-test.pdf" download>Download original (Adobe)</a>
+      <a class="btn btn-secondary" href="https://view.drm.saiglobal.com/wqRCVg" target="_blank" rel="noopener">Intertek online</a>
+    </div>
   </header>
-  <iframe src="AS_1391-2020-tensile-test.pdf" title="AS 1391-2020 Tensile Test PDF"></iframe>
+  <main>
+    <aside>
+      <h2>Browser view (flattened)</h2>
+      <p>
+        This viewer shows a rasterized copy that displays the licence page and
+        protection notices in any browser. It does not contain the full standard
+        text — that requires Adobe Reader unlock.
+      </p>
+      <div class="notice">
+        Blank pages were caused by stripping Vitrium DRM JavaScript. The fix uses
+        reverse-skill-router analysis (js-reverse workflow) and page rasterization
+        instead of destructive cleaning.
+      </div>
+      <h2 style="margin-top: 18px;">Full document access</h2>
+      <ol>
+        <li>Download the <strong>original</strong> PDF.</li>
+        <li>Open in <strong>Adobe Acrobat Reader DC</strong>.</li>
+        <li>Enable Acrobat JavaScript; disable Global Object Security Policy.</li>
+        <li>Sign in with your Intertek Inform account.</li>
+        <li>After unlock: File → Print → Save as PDF for a fully browser-readable copy.</li>
+      </ol>
+    </aside>
+    <iframe src="AS_1391-2020-tensile-test-flattened.pdf#view=FitH" title="AS 1391-2020 browser PDF"></iframe>
+  </main>
 </body>
 </html>
