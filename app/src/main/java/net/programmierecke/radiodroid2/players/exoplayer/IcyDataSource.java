@@ -14,8 +14,11 @@ import com.google.android.exoplayer2.upstream.TransferListener;
 import net.programmierecke.radiodroid2.station.live.ShoutcastInfo;
 import net.programmierecke.radiodroid2.station.live.StreamLiveInfo;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.charset.Charset;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -83,6 +86,8 @@ public class IcyDataSource implements HttpDataSource {
 
     int metadataBytesToSkip = 0;
     int remainingUntilMetadata = Integer.MAX_VALUE;
+    private int metadataFrameSize = 0;
+    private final ByteArrayOutputStream metadataBuffer = new ByteArrayOutputStream();
     private boolean opened;
 
     ShoutcastInfo shoutcastInfo;
@@ -160,6 +165,8 @@ public class IcyDataSource implements HttpDataSource {
             dataSourceListener.onDataSourceShoutcastInfo(shoutcastInfo);
 
             metadataBytesToSkip = 0;
+            metadataFrameSize = 0;
+            metadataBuffer.reset();
             if (shoutcastInfo != null) {
                 remainingUntilMetadata = shoutcastInfo.metadataOffset;
             } else {
@@ -187,7 +194,9 @@ public class IcyDataSource implements HttpDataSource {
     public int read(byte[] buffer, int offset, int readLength) throws HttpDataSourceException {
         try {
             final int bytesTransferred = readInternal(buffer, offset, readLength);
-            transferListener.onBytesTransferred(this, dataSpec, true, bytesTransferred);
+            if (bytesTransferred > 0) {
+                transferListener.onBytesTransferred(this, dataSpec, true, bytesTransferred);
+            }
             return bytesTransferred;
         } catch (HttpDataSourceException readError) {
             dataSourceListener.onDataSourceConnectionLost();
@@ -196,31 +205,74 @@ public class IcyDataSource implements HttpDataSource {
     }
 
     void sendToDataSourceListenersWithoutMetadata(byte[] buffer, int offset, int bytesAvailable) {
-        int canSkip = Math.min(metadataBytesToSkip, bytesAvailable);
-        offset += canSkip;
-        bytesAvailable -= canSkip;
-        remainingUntilMetadata -= canSkip;
         while (bytesAvailable > 0) {
-            if (bytesAvailable > remainingUntilMetadata) { // do we need to handle a metadata frame at all?
-                if (remainingUntilMetadata > 0) { // is there any audio data before the metadata frame?
-                    dataSourceListener.onDataSourceBytesRead(buffer, offset, remainingUntilMetadata);
-                    offset += remainingUntilMetadata;
-                    bytesAvailable -= remainingUntilMetadata;
+            if (metadataBytesToSkip > 0) {
+                int bytesToConsume = Math.min(metadataBytesToSkip, bytesAvailable);
+                int consumedInFrame = metadataFrameSize + 1 - metadataBytesToSkip;
+                int payloadOffset = consumedInFrame == 0 ? 1 : 0;
+                int payloadLength = Math.max(0, bytesToConsume - payloadOffset);
+                if (payloadLength > 0) {
+                    metadataBuffer.write(buffer, offset + payloadOffset, payloadLength);
                 }
-                metadataBytesToSkip = buffer[offset] * 16 + 1;
-                remainingUntilMetadata = shoutcastInfo.metadataOffset + metadataBytesToSkip;
+
+                metadataBytesToSkip -= bytesToConsume;
+                remainingUntilMetadata -= bytesToConsume;
+                offset += bytesToConsume;
+                bytesAvailable -= bytesToConsume;
+
+                if (metadataBytesToSkip == 0) {
+                    publishMetadata();
+                    metadataFrameSize = 0;
+                    metadataBuffer.reset();
+                }
+                continue;
             }
 
-            int bytesLeft = Math.min(bytesAvailable, remainingUntilMetadata);
-            if (bytesLeft > metadataBytesToSkip) { // is there audio data left we need to send?
-                dataSourceListener.onDataSourceBytesRead(buffer, offset + metadataBytesToSkip, bytesLeft - metadataBytesToSkip);
-                metadataBytesToSkip = 0;
-            } else {
-                metadataBytesToSkip -= bytesLeft;
+            if (remainingUntilMetadata > 0) {
+                int audioBytes = Math.min(bytesAvailable, remainingUntilMetadata);
+                dataSourceListener.onDataSourceBytesRead(buffer, offset, audioBytes);
+                offset += audioBytes;
+                bytesAvailable -= audioBytes;
+                remainingUntilMetadata -= audioBytes;
+                continue;
             }
-            offset += bytesLeft;
-            bytesAvailable -= bytesLeft;
-            remainingUntilMetadata -= bytesLeft;
+
+            metadataFrameSize = (buffer[offset] & 0xff) * 16;
+            metadataBytesToSkip = metadataFrameSize + 1; // Includes the metadata-length byte.
+            remainingUntilMetadata = shoutcastInfo.metadataOffset + metadataBytesToSkip;
+        }
+    }
+
+    private void publishMetadata() {
+        if (metadataFrameSize == 0) {
+            return;
+        }
+
+        String raw = new String(metadataBuffer.toByteArray(), Charset.forName("UTF-8"))
+                .replace("\u0000", "")
+                .trim();
+        if (raw.isEmpty()) {
+            return;
+        }
+
+        Map<String, String> metadata = new HashMap<>();
+        for (String entry : raw.split(";")) {
+            int equals = entry.indexOf('=');
+            if (equals < 1) {
+                continue;
+            }
+
+            String key = entry.substring(0, equals).trim();
+            String value = entry.substring(equals + 1).trim();
+            if (value.length() >= 2 && value.startsWith("'") && value.endsWith("'")) {
+                value = value.substring(1, value.length() - 1);
+            }
+            metadata.put(key, value);
+        }
+
+        if (!metadata.isEmpty()) {
+            streamLiveInfo = new StreamLiveInfo(metadata);
+            dataSourceListener.onDataSourceStreamLiveInfo(streamLiveInfo);
         }
     }
 
@@ -238,7 +290,9 @@ public class IcyDataSource implements HttpDataSource {
             throw new HttpDataSourceException(e, dataSpec, HttpDataSourceException.TYPE_READ);
         }
 
-        sendToDataSourceListenersWithoutMetadata(buffer, offset, bytesRead);
+        if (bytesRead > 0) {
+            sendToDataSourceListenersWithoutMetadata(buffer, offset, bytesRead);
+        }
 
         return bytesRead;
     }

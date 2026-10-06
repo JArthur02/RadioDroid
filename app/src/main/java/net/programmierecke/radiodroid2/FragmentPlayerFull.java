@@ -20,6 +20,7 @@ import android.view.ViewTreeObserver;
 import android.view.animation.AnimationUtils;
 import android.widget.ImageButton;
 import android.widget.ImageView;
+import android.widget.SeekBar;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -118,6 +119,10 @@ public class FragmentPlayerFull extends Fragment {
     private TextView textViewTimePlayed;
     private TextView textViewNetworkUsageInfo;
     private TextView textViewTimeCached;
+    private SeekBar seekBarPlayhead;
+
+    private boolean playheadDragging = false;
+    private long playheadSeekableStartMs = 0;
 
     private Group groupRecordings;
     private ImageView imgRecordingIcon;
@@ -225,6 +230,7 @@ public class FragmentPlayerFull extends Fragment {
         textViewTimePlayed = view.findViewById(R.id.textViewTimePlayed);
         textViewNetworkUsageInfo = view.findViewById(R.id.textViewNetworkUsageInfo);
         textViewTimeCached = view.findViewById(R.id.textViewTimeCached);
+        seekBarPlayhead = view.findViewById(R.id.seekBarPlayhead);
 
         groupRecordings = view.findViewById(R.id.group_recording_info);
         imgRecordingIcon = view.findViewById(R.id.imgRecordingIcon);
@@ -240,6 +246,35 @@ public class FragmentPlayerFull extends Fragment {
         btnNext = view.findViewById(R.id.buttonNext);
         btnRecord = view.findViewById(R.id.buttonRecord);
         btnFavourite = view.findViewById(R.id.buttonFavorite);
+
+        seekBarPlayhead.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override
+            public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
+                if (!fromUser) {
+                    return;
+                }
+                long positionMs = playheadSeekableStartMs + progress * 1000L;
+                textViewTimePlayed.setText(DateUtils.formatElapsedTime(positionMs / 1000));
+            }
+
+            @Override
+            public void onStartTrackingTouch(SeekBar seekBar) {
+                playheadDragging = true;
+                if (touchInterceptListener != null) {
+                    touchInterceptListener.requestDisallowInterceptTouchEvent(true);
+                }
+            }
+
+            @Override
+            public void onStopTrackingTouch(SeekBar seekBar) {
+                long positionMs = playheadSeekableStartMs + seekBar.getProgress() * 1000L;
+                PlayerServiceUtil.seekTo(positionMs);
+                playheadDragging = false;
+                if (touchInterceptListener != null) {
+                    touchInterceptListener.requestDisallowInterceptTouchEvent(false);
+                }
+            }
+        });
 
         historyAndRecordsPagerAdapter.recyclerViewSongHistory.setAdapter(trackHistoryAdapter);
 
@@ -825,6 +860,8 @@ public class FragmentPlayerFull extends Fragment {
     }
 
     private static class TimedUpdateTask extends RefreshHandler.ObjectBoundRunnable<FragmentPlayerFull> {
+        private static final long LIVE_EDGE_TOLERANCE_MS = 2000;
+
         TimedUpdateTask(FragmentPlayerFull obj) {
             super(obj);
         }
@@ -841,15 +878,47 @@ public class FragmentPlayerFull extends Fragment {
 
                 fragmentPlayerFull.textViewNetworkUsageInfo.setText(networkUsageInfo);
 
-                final long now = System.currentTimeMillis();
-                final long startTime = PlayerServiceUtil.getLastPlayStartTime();
-                long deltaSeconds = startTime > 0 ? ((now - startTime) / 1000) : 0;
-                deltaSeconds = Math.max(deltaSeconds, 0);
-                fragmentPlayerFull.textViewTimePlayed.setText(DateUtils.formatElapsedTime(deltaSeconds));
+                long currentMs = PlayerServiceUtil.getCurrentPositionMs();
+                long liveEdgeMs = PlayerServiceUtil.getLiveEdgePositionMs();
+                long seekableStartMs = PlayerServiceUtil.getSeekableStartPositionMs();
 
-                fragmentPlayerFull.textViewTimeCached.setText(DateUtils.formatElapsedTime(PlayerServiceUtil.getBufferedSeconds()));
+                // Fall back to wall-clock elapsed if the player has not reported a position yet.
+                if (currentMs <= 0) {
+                    final long now = System.currentTimeMillis();
+                    final long startTime = PlayerServiceUtil.getLastPlayStartTime();
+                    currentMs = startTime > 0 ? Math.max(0, now - startTime) : 0;
+                    liveEdgeMs = Math.max(liveEdgeMs, currentMs);
+                }
+
+                if (!fragmentPlayerFull.playheadDragging) {
+                    fragmentPlayerFull.textViewTimePlayed.setText(DateUtils.formatElapsedTime(currentMs / 1000));
+                }
+
+                boolean atLiveEdge = liveEdgeMs - currentMs <= LIVE_EDGE_TOLERANCE_MS;
+                if (atLiveEdge) {
+                    fragmentPlayerFull.textViewTimeCached.setText(fragmentPlayerFull.getString(R.string.player_live));
+                } else {
+                    long behindLiveSeconds = Math.max(0, (liveEdgeMs - currentMs) / 1000);
+                    fragmentPlayerFull.textViewTimeCached.setText("-" + DateUtils.formatElapsedTime(behindLiveSeconds));
+                }
+
+                boolean canSeek = PlayerServiceUtil.canSeek();
+                fragmentPlayerFull.seekBarPlayhead.setEnabled(canSeek);
+                fragmentPlayerFull.seekBarPlayhead.setVisibility(canSeek ? View.VISIBLE : View.GONE);
+
+                if (canSeek && !fragmentPlayerFull.playheadDragging) {
+                    fragmentPlayerFull.playheadSeekableStartMs = seekableStartMs;
+                    long rangeMs = Math.max(0, liveEdgeMs - seekableStartMs);
+                    int maxSeconds = Math.max(1, (int) (rangeMs / 1000));
+                    int progressSeconds = (int) Math.max(0, Math.min(maxSeconds, (currentMs - seekableStartMs) / 1000));
+                    fragmentPlayerFull.seekBarPlayhead.setMax(maxSeconds);
+                    fragmentPlayerFull.seekBarPlayhead.setProgress(progressSeconds);
+                }
 
                 fragmentPlayerFull.updateRunningRecording();
+            } else {
+                fragmentPlayerFull.seekBarPlayhead.setEnabled(false);
+                fragmentPlayerFull.seekBarPlayhead.setVisibility(View.GONE);
             }
         }
     }

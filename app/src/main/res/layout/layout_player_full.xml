@@ -133,7 +133,23 @@
                 app:layout_constraintEnd_toEndOf="parent"
                 app:layout_constraintStart_toStartOf="parent"
                 app:layout_constraintTop_toBottomOf="@+id/space"
-                tools:text="-10s" />
+                tools:text="LIVE" />
+
+            <SeekBar
+                android:id="@+id/seekBarPlayhead"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="8dp"
+                android:layout_marginLeft="8dp"
+                android:layout_marginTop="4dp"
+                android:layout_marginEnd="8dp"
+                android:layout_marginRight="8dp"
+                android:contentDescription="@string/description_playhead"
+                android:max="1000"
+                android:progress="1000"
+                app:layout_constraintEnd_toEndOf="parent"
+                app:layout_constraintStart_toStartOf="parent"
+                app:layout_constraintTop_toBottomOf="@+id/textViewTimePlayed" />
 
             <View
                 android:id="@+id/divider1"
@@ -142,7 +158,7 @@
                 android:layout_marginTop="8dp"
                 android:layout_marginBottom="8dp"
                 android:background="?android:attr/dividerVertical"
-                app:layout_constraintTop_toBottomOf="@+id/textViewTimeCached" />
+                app:layout_constraintTop_toBottomOf="@+id/seekBarPlayhead" />
 
             <ImageView
                 android:id="@+id/imgRecordingIcon"

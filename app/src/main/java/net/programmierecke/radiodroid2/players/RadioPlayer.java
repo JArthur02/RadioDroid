@@ -290,6 +290,26 @@ public class RadioPlayer implements PlayerWrapper.PlayListener, Recordable {
         return currentPlayer.getBufferedMs() / 1000;
     }
 
+    public long getCurrentPositionMs() {
+        return currentPlayer.getCurrentPositionMs();
+    }
+
+    public long getLiveEdgePositionMs() {
+        return currentPlayer.getLiveEdgePositionMs();
+    }
+
+    public long getSeekableStartPositionMs() {
+        return currentPlayer.getSeekableStartPositionMs();
+    }
+
+    public void seekTo(long positionMs) {
+        playerThreadHandler.post(() -> currentPlayer.seekTo(positionMs));
+    }
+
+    public boolean canSeek() {
+        return currentPlayer.canSeek();
+    }
+
     public boolean isLocal() {
         return currentPlayer.isLocal();
     }

@@ -1,8 +1,8 @@
 // Top-level build file where you can add configuration options common to all sub-projects/modules.
 buildscript {
     repositories {
-        jcenter()
         google()
+        mavenCentral()
     }
     dependencies {
         classpath 'com.android.tools.build:gradle:7.3.1'
@@ -12,9 +12,16 @@ buildscript {
 
 allprojects {
     repositories {
-        jcenter()
-        mavenCentral()
         google()
+        mavenCentral()
         maven { url 'https://jitpack.io' }
+        // JCenter is read-only/offline. This scoped mirror keeps the last Android-4-compatible
+        // picasso-transformations artifact available without routing other dependencies through it.
+        maven {
+            url 'https://maven.aliyun.com/repository/jcenter'
+            content {
+                includeModule 'jp.wasabeef', 'picasso-transformations'
+            }
+        }
     }
 }

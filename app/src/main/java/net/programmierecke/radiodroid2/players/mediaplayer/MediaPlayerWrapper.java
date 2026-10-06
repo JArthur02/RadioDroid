@@ -173,6 +173,31 @@ public class MediaPlayerWrapper implements PlayerWrapper, StreamProxyListener {
     }
 
     @Override
+    public long getCurrentPositionMs() {
+        return 0;
+    }
+
+    @Override
+    public long getLiveEdgePositionMs() {
+        return 0;
+    }
+
+    @Override
+    public long getSeekableStartPositionMs() {
+        return 0;
+    }
+
+    @Override
+    public void seekTo(long positionMs) {
+        // MediaPlayer path does not support timeshift seeking.
+    }
+
+    @Override
+    public boolean canSeek() {
+        return false;
+    }
+
+    @Override
     public int getAudioSessionId() {
         if (mediaPlayer != null) {
             return mediaPlayer.getAudioSessionId();
