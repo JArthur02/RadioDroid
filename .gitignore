@@ -42,7 +42,3 @@ build/*
 .DS_Store
 
 *.aab
-
-# Allow publishing timeshift playhead APKs for this PR
-!artifacts/
-!artifacts/*.apk
