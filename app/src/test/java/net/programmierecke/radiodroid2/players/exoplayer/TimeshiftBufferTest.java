@@ -15,6 +15,7 @@ import org.junit.rules.TemporaryFolder;
 
 import java.io.File;
 import java.util.Arrays;
+import java.util.concurrent.atomic.AtomicLong;
 
 import okhttp3.OkHttpClient;
 
@@ -167,6 +168,42 @@ public class TimeshiftBufferTest {
         TimeshiftBuffer.SeekTarget mid = buffer.resolveSeekTarget(1000);
         assertEquals(1000, mid.timeMs);
         assertEquals(BYTES_PER_SECOND, mid.bytePosition);
+    }
+
+    @Test
+    public void estimatesBitrateWhenStationSendsNoHeader() throws Exception {
+        AtomicLong now = new AtomicLong(10_000);
+        buffer.setClockForTest(now::get);
+
+        // A server burst on connect must not inflate the estimate, then 128 kbps in real time.
+        buffer.ingestForTest(new byte[4 * BYTES_PER_SECOND], /* bitrate= */ 0);
+        assertFalse(buffer.hasSeekableAudio());
+        for (int second = 1; second <= 10; second++) {
+            now.addAndGet(1000);
+            buffer.appendForTest(new byte[BYTES_PER_SECOND]);
+        }
+
+        assertTrue(buffer.hasSeekableAudio());
+        assertEquals(14_000, buffer.getLiveEdgeMs());
+        assertEquals(14L * BYTES_PER_SECOND, buffer.getWritePositionForTest());
+        TimeshiftBuffer.SeekTarget target = buffer.resolveSeekTarget(4_000);
+        assertEquals(4_000, target.timeMs);
+        assertEquals(4L * BYTES_PER_SECOND, target.bytePosition);
+    }
+
+    @Test
+    public void doesNotEstimateBitrateBeforeMeasurementWindowEnds() throws Exception {
+        AtomicLong now = new AtomicLong(10_000);
+        buffer.setClockForTest(now::get);
+
+        buffer.ingestForTest(new byte[BYTES_PER_SECOND], /* bitrate= */ 0);
+        for (int second = 1; second <= 5; second++) {
+            now.addAndGet(1000);
+            buffer.appendForTest(new byte[BYTES_PER_SECOND]);
+        }
+
+        assertFalse(buffer.hasSeekableAudio());
+        assertEquals(0, buffer.getLiveEdgeMs());
     }
 
     @Test

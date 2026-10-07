@@ -43,6 +43,19 @@ final class TimeshiftBuffer {
     private static final long RECORDER_JOIN_TIMEOUT_MS = 5000L;
     private static final String FILE_PREFIX = "radiodroid-timeshift-";
 
+    // Many stations send no icy-br / ice-audio-info header. Without a bitrate the byte-to-time
+    // mapping is unknown, so measure it: skip the connect burst, then average the real byte rate.
+    private static final long ESTIMATE_SETTLE_MS = 3000L;
+    private static final long ESTIMATE_WINDOW_MS = 6000L;
+    private static final int MIN_ESTIMATED_KBPS = 16;
+    private static final int MAX_ESTIMATED_KBPS = 640;
+    private static final int[] COMMON_BITRATES_KBPS =
+            {24, 32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320};
+
+    interface Clock {
+        long nowMs();
+    }
+
     static final class SeekTarget {
         final long bytePosition;
         final long timeMs;
@@ -114,6 +127,10 @@ final class TimeshiftBuffer {
     private long liveEdgeMs;
     private long lastCheckpointMs;
     private int bitrateKbps;
+    private Clock clock = System::currentTimeMillis;
+    private long firstAudioWallMs;
+    private long estimateRefWallMs;
+    private long estimateRefPosition;
     private double durationRemainderMs;
     private long windowDurationMs = WINDOW_DURATION_MS;
     private long retentionMarginMs = RETENTION_MARGIN_MS;
@@ -188,6 +205,12 @@ final class TimeshiftBuffer {
         }
     }
 
+    void setClockForTest(@NonNull Clock testClock) {
+        synchronized (monitor) {
+            clock = testClock;
+        }
+    }
+
     void setSegmentSizeForTest(long bytes) {
         synchronized (monitor) {
             segmentSizeBytes = Math.max(1024, bytes);
@@ -246,6 +269,9 @@ final class TimeshiftBuffer {
             liveEdgeMs = 0;
             lastCheckpointMs = 0;
             bitrateKbps = 0;
+            firstAudioWallMs = 0;
+            estimateRefWallMs = 0;
+            estimateRefPosition = 0;
             durationRemainderMs = 0;
             segments.clear();
             checkpoints.clear();
@@ -364,7 +390,12 @@ final class TimeshiftBuffer {
                             throw new IOException("Radio stream ended");
                         }
                     }
-                } catch (IOException error) {
+                } catch (IOException | RuntimeException failure) {
+                    // An unchecked exception on this thread would take down the whole app, so treat
+                    // it like any other connection failure.
+                    IOException error = failure instanceof IOException
+                            ? (IOException) failure
+                            : new IOException(failure);
                     if (!running) {
                         break;
                     }
@@ -516,6 +547,7 @@ final class TimeshiftBuffer {
                 remaining -= window.length;
 
                 updateDuration(window.length);
+                estimateBitrateIfUnknownLocked();
                 if (liveEdgeMs - lastCheckpointMs >= CHECKPOINT_INTERVAL_MS) {
                     checkpoints.add(new Checkpoint(writePosition, liveEdgeMs));
                     lastCheckpointMs = liveEdgeMs;
@@ -527,6 +559,48 @@ final class TimeshiftBuffer {
                 monitor.notifyAll();
             }
         }
+    }
+
+    private void estimateBitrateIfUnknownLocked() {
+        if (bitrateKbps > 0) {
+            return;
+        }
+
+        long now = clock.nowMs();
+        if (firstAudioWallMs == 0) {
+            firstAudioWallMs = now;
+            return;
+        }
+        if (estimateRefWallMs == 0) {
+            if (now - firstAudioWallMs >= ESTIMATE_SETTLE_MS) {
+                estimateRefWallMs = now;
+                estimateRefPosition = writePosition;
+            }
+            return;
+        }
+
+        long elapsedMs = now - estimateRefWallMs;
+        if (elapsedMs < ESTIMATE_WINDOW_MS) {
+            return;
+        }
+
+        double measured = (writePosition - estimateRefPosition) * 8.0 / elapsedMs;
+        if (measured < MIN_ESTIMATED_KBPS || measured > MAX_ESTIMATED_KBPS) {
+            // Implausible (stalled or bursty) window; measure again.
+            estimateRefWallMs = now;
+            estimateRefPosition = writePosition;
+            return;
+        }
+        applyBitrateLocked(snapToCommonBitrate(measured));
+    }
+
+    private static int snapToCommonBitrate(double measuredKbps) {
+        for (int common : COMMON_BITRATES_KBPS) {
+            if (Math.abs(measuredKbps - common) <= common * 0.05) {
+                return common;
+            }
+        }
+        return (int) Math.round(measuredKbps);
     }
 
     private void updateDuration(int audioBytes) {
