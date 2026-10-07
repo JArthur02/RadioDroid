@@ -58,6 +58,8 @@ public class RadioPlayer implements PlayerWrapper.PlayListener, Recordable {
 
     private PlayerListener playerListener;
     private PlayState playState = PlayState.Idle;
+    // Set when the current player was paused by pause(true) and can continue where it stopped.
+    private volatile boolean pausedInPlace;
 
     private StreamLiveInfo lastLiveInfo;
 
@@ -98,6 +100,7 @@ public class RadioPlayer implements PlayerWrapper.PlayListener, Recordable {
     }
 
     public final void play(final String stationURL, final String streamName, final boolean isAlarm) {
+        pausedInPlace = false;
         setState(PlayState.PrePlaying, -1);
 
         this.streamName = streamName;
@@ -119,6 +122,7 @@ public class RadioPlayer implements PlayerWrapper.PlayListener, Recordable {
     }
 
     public final void play(final DataRadioStation station, final boolean isAlarm) {
+        pausedInPlace = false;
         setState(PlayState.PrePlaying, -1);
 
         playStationTask = new PlayStationTask(station, mainContext,
@@ -142,6 +146,14 @@ public class RadioPlayer implements PlayerWrapper.PlayListener, Recordable {
     }
 
     public final void pause() {
+        pause(false);
+    }
+
+    /**
+     * @param keepSession pause where playback is so {@link #resumeInPlace()} can continue from the
+     *                    same point, if the current player supports it.
+     */
+    public final void pause(final boolean keepSession) {
         cancelStationLinkRetrieval();
 
         playerThreadHandler.post(() -> {
@@ -150,7 +162,10 @@ public class RadioPlayer implements PlayerWrapper.PlayListener, Recordable {
             }
 
             final int audioSessionId = getAudioSessionId();
-            currentPlayer.pause();
+            pausedInPlace = keepSession && currentPlayer.pauseInPlace();
+            if (!pausedInPlace) {
+                currentPlayer.pause();
+            }
 
             if (BuildConfig.DEBUG) {
                 playerThreadHandler.removeCallbacks(bufferCheckRunnable);
@@ -158,6 +173,34 @@ public class RadioPlayer implements PlayerWrapper.PlayListener, Recordable {
 
             setState(PlayState.Paused, audioSessionId);
         });
+    }
+
+    /** True if the player is paused in place and {@link #resumeInPlace()} can continue it. */
+    public final boolean hasPausedSession() {
+        return pausedInPlace && playState == PlayState.Paused;
+    }
+
+    /** Continues from the exact point playback paused at. Returns false if there is no such session. */
+    public final boolean resumeInPlace() {
+        if (!hasPausedSession()) {
+            return false;
+        }
+        pausedInPlace = false;
+        if (!currentPlayer.resumeInPlace()) {
+            return false;
+        }
+        // The player reports Playing once it is ready; until then this is "starting".
+        setState(PlayState.PrePlaying, -1);
+        return true;
+    }
+
+    /** Gives up a session held by {@code pause(true)}; the state stays Paused. */
+    public final void releasePausedSession() {
+        if (!pausedInPlace) {
+            return;
+        }
+        pausedInPlace = false;
+        playerThreadHandler.post(() -> currentPlayer.pause());
     }
 
     public final void stop() {
@@ -263,6 +306,10 @@ public class RadioPlayer implements PlayerWrapper.PlayListener, Recordable {
 
         if (playState == state) {
             return;
+        }
+
+        if (state == PlayState.Idle) {
+            pausedInPlace = false;
         }
 
         if (BuildConfig.DEBUG) {

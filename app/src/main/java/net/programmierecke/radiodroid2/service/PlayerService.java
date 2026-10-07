@@ -112,6 +112,9 @@ public class PlayerService extends JobIntentService implements RadioPlayer.Playe
     // How often to check whether scrubbing became available (or went away) while playing, so the
     // notification can add or drop the rewind/forward buttons.
     private static final long SEEK_AVAILABILITY_CHECK_MS = 3000L;
+    // How long a session paused by another app's audio is held (and kept recording) so it can
+    // continue from where it stopped; after that it is released and resuming starts live.
+    private static final long PAUSED_SESSION_KEEP_MS = 10 * 60 * 1000L;
 
     private static final float FULL_VOLUME = 100f;
     private static final float DUCK_VOLUME = 40f;
@@ -698,7 +701,17 @@ public class PlayerService extends JobIntentService implements RadioPlayer.Playe
             lastMeteredConnectionWarningTime = System.currentTimeMillis();
         }
 
-        releaseWakeLockAndWifiLock();
+        // Another app took the audio: pause where we are instead of closing, so playback can
+        // continue from the same point. A short interruption (call, navigation prompt) keeps the
+        // locks so the recording survives; a permanent loss releases them.
+        final boolean interrupted = pauseReason == PauseReason.FOCUS_LOSS_TRANSIENT
+                || pauseReason == PauseReason.FOCUS_LOSS;
+
+        handler.removeCallbacks(releasePausedSessionTask);
+
+        if (pauseReason != PauseReason.FOCUS_LOSS_TRANSIENT) {
+            releaseWakeLockAndWifiLock();
+        }
 
         // Pausing due to focus loss means that we can gain it again
         // so we should keep the focus and the wait for callback.
@@ -706,8 +719,28 @@ public class PlayerService extends JobIntentService implements RadioPlayer.Playe
             releaseAudioFocus();
         }
 
-        radioPlayer.pause();
+        radioPlayer.pause(interrupted);
+
+        // Also covers a manual pause on top of a session that is already paused in place.
+        if (interrupted || radioPlayer.hasPausedSession()) {
+            handler.postDelayed(releasePausedSessionTask, PAUSED_SESSION_KEEP_MS);
+        }
     }
+
+    private final Runnable releasePausedSessionTask = new Runnable() {
+        @Override
+        public void run() {
+            if (BuildConfig.DEBUG) Log.d(TAG, "releasing the session paused by interruption.");
+
+            radioPlayer.releasePausedSession();
+            releaseWakeLockAndWifiLock();
+            if (pauseReason == PauseReason.FOCUS_LOSS_TRANSIENT) {
+                // Nobody will hand the focus back to a released session.
+                pauseReason = PauseReason.NONE;
+                releaseAudioFocus();
+            }
+        }
+    };
 
     public void next() {
         if (currentStation == null) {
@@ -760,6 +793,20 @@ public class PlayerService extends JobIntentService implements RadioPlayer.Playe
         this.pauseReason = PauseReason.NONE;
         this.lastMeteredConnectionWarningTime = 0;
 
+        handler.removeCallbacks(releasePausedSessionTask);
+
+        // Paused by an interruption: continue the same session from the stop point. No station
+        // lookup is needed, so this also works without a network connection.
+        if (!radioPlayer.isPlaying() && radioPlayer.hasPausedSession()
+                && acquireAudioFocus() == AudioManager.AUDIOFOCUS_REQUEST_GRANTED) {
+            enableMediaSession();
+            acquireWakeLockAndWifiLock();
+            startMeteredConnectionListener();
+            if (radioPlayer.resumeInPlace()) {
+                return;
+            }
+        }
+
         if (!radioPlayer.isPlaying()) {
             RadioDroidApp radioDroidApp = (RadioDroidApp) getApplication();
             DataRadioStation station = currentStation;
@@ -789,6 +836,7 @@ public class PlayerService extends JobIntentService implements RadioPlayer.Playe
         this.pauseReason = PauseReason.NONE;
         this.lastMeteredConnectionWarningTime = 0;
         this.notificationIsActive = false;
+        handler.removeCallbacks(releasePausedSessionTask);
 
         liveInfo = new StreamLiveInfo(null);
         streamInfo = null;
@@ -1063,6 +1111,11 @@ public class PlayerService extends JobIntentService implements RadioPlayer.Playe
     void seekRelative(long deltaMs) {
         if (radioPlayer == null || !radioPlayer.canSeek()) {
             return;
+        }
+        if (!radioPlayer.isPlaying()) {
+            // Paused in place (for example after an interruption): pick the session back up
+            // first so the target is relative to the stop point and focus is held again.
+            resume();
         }
         radioPlayer.seekTo(radioPlayer.getCurrentPositionMs() + deltaMs);
     }
