@@ -124,15 +124,19 @@ final class TimeshiftBuffer {
     private RandomAccessFile segmentWriter;
     private Segment currentSegment;
     private long writePosition;
-    private long liveEdgeMs;
+    // Read by the UI thread every second without taking the monitor, which the recorder and the
+    // player's loader hold across file creation and deletion. Written only under the monitor.
+    private volatile long liveEdgeMs;
+    private volatile long retainedStartMs;
+    private volatile int bitrateKbps;
     private long lastCheckpointMs;
-    private int bitrateKbps;
+    private final List<File> expiredFiles = new ArrayList<>();
     private Clock clock = System::currentTimeMillis;
     private long firstAudioWallMs;
     private long estimateRefWallMs;
     private long estimateRefPosition;
     private double durationRemainderMs;
-    private long windowDurationMs = WINDOW_DURATION_MS;
+    private volatile long windowDurationMs = WINDOW_DURATION_MS;
     private long retentionMarginMs = RETENTION_MARGIN_MS;
     private long segmentSizeBytes = SEGMENT_SIZE_BYTES;
 
@@ -260,9 +264,6 @@ final class TimeshiftBuffer {
             if (!directory.exists() && !directory.mkdirs()) {
                 throw new IOException("Could not create timeshift cache directory");
             }
-            if (deleteAbandoned) {
-                deleteAbandonedSessions();
-            }
             running = true;
             terminalError = null;
             writePosition = 0;
@@ -276,7 +277,12 @@ final class TimeshiftBuffer {
             segments.clear();
             checkpoints.clear();
             checkpoints.add(new Checkpoint(0, 0));
+            updateRetainedStartLocked();
             activeReaders.clear();
+            expiredFiles.clear();
+        }
+        if (deleteAbandoned) {
+            deleteAbandonedSessionsAsync();
         }
     }
 
@@ -285,23 +291,17 @@ final class TimeshiftBuffer {
     }
 
     long getLiveEdgeMs() {
-        synchronized (monitor) {
-            return liveEdgeMs;
-        }
+        return liveEdgeMs;
     }
 
     long getSeekableStartMs() {
-        synchronized (monitor) {
-            return seekableStartMsLocked();
-        }
+        return seekableStartMs();
     }
 
     boolean hasSeekableAudio() {
-        synchronized (monitor) {
-            return bitrateKbps > 0
-                    && liveEdgeMs - seekableStartMsLocked() >= 2000
-                    && terminalError == null;
-        }
+        return bitrateKbps > 0
+                && liveEdgeMs - seekableStartMs() >= 2000
+                && terminalError == null;
     }
 
     SeekTarget resolveSeekTarget(long requestedTimeMs) {
@@ -316,9 +316,16 @@ final class TimeshiftBuffer {
         }
     }
 
+    private long seekableStartMs() {
+        return Math.max(retainedStartMs, liveEdgeMs - windowDurationMs);
+    }
+
     private long seekableStartMsLocked() {
-        long retainedStart = checkpoints.isEmpty() ? 0 : checkpoints.get(0).timeMs;
-        return Math.max(retainedStart, liveEdgeMs - windowDurationMs);
+        return seekableStartMs();
+    }
+
+    private void updateRetainedStartLocked() {
+        retainedStartMs = checkpoints.isEmpty() ? 0 : checkpoints.get(0).timeMs;
     }
 
     private long bytePositionForTimeLocked(long targetMs) {
@@ -509,6 +516,7 @@ final class TimeshiftBuffer {
         } else {
             lastCheckpointMs = 0;
         }
+        updateRetainedStartLocked();
         for (Segment segment : segments) {
             segment.startTimeMs = (long) ((segment.startPosition * 8.0) / bitrateKbps);
         }
@@ -558,6 +566,7 @@ final class TimeshiftBuffer {
                 evictExpiredSegments();
                 monitor.notifyAll();
             }
+            deleteExpiredFiles();
         }
     }
 
@@ -658,8 +667,8 @@ final class TimeshiftBuffer {
                 break;
             }
             Segment expired = segments.remove(0);
-            //noinspection ResultOfMethodCallIgnored
-            expired.file.delete();
+            // Deleted by deleteExpiredFiles() once the monitor is released.
+            expiredFiles.add(expired.file);
         }
 
         if (!segments.isEmpty()) {
@@ -673,6 +682,23 @@ final class TimeshiftBuffer {
                     break;
                 }
             }
+            updateRetainedStartLocked();
+        }
+    }
+
+    /** Deletes segments queued by {@link #evictExpiredSegments()}; call without holding the monitor. */
+    private void deleteExpiredFiles() {
+        List<File> toDelete;
+        synchronized (monitor) {
+            if (expiredFiles.isEmpty()) {
+                return;
+            }
+            toDelete = new ArrayList<>(expiredFiles);
+            expiredFiles.clear();
+        }
+        for (File file : toDelete) {
+            //noinspection ResultOfMethodCallIgnored
+            file.delete();
         }
     }
 
@@ -688,6 +714,7 @@ final class TimeshiftBuffer {
             // Readers leaving may unblock eviction of segments past the window.
             evictExpiredSegments();
         }
+        deleteExpiredFiles();
     }
 
     private int read(long position, byte[] buffer, int offset, int length) throws IOException {
@@ -768,57 +795,79 @@ final class TimeshiftBuffer {
         }
     }
 
+    /**
+     * Stops recording and removes this session's files. Called from the player thread (the main
+     * thread), so it only flips state and hands the blocking work (closing the socket, waiting for
+     * the recorder, deleting up to two hours of segment files) to a short-lived cleanup thread.
+     */
     public void close() {
-        Thread recorder;
+        final Thread recorder;
         synchronized (monitor) {
             running = false;
             recorder = recorderThread;
             monitor.notifyAll();
         }
 
-        IcyDataSource source = upstream;
-        if (source != null) {
-            try {
-                source.close();
-            } catch (IOException ignored) {
+        Thread cleanup = new Thread(() -> {
+            IcyDataSource source = upstream;
+            if (source != null) {
+                try {
+                    source.close();
+                } catch (IOException ignored) {
+                }
             }
-        }
-        if (recorder != null) {
-            recorder.interrupt();
-            try {
-                recorder.join(RECORDER_JOIN_TIMEOUT_MS);
-            } catch (InterruptedException interrupted) {
-                Thread.currentThread().interrupt();
+            if (recorder != null) {
+                recorder.interrupt();
+                try {
+                    recorder.join(RECORDER_JOIN_TIMEOUT_MS);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                }
             }
-        }
 
-        synchronized (monitor) {
-            closeWriter();
-        }
-        deleteSessionFiles();
+            synchronized (monitor) {
+                closeWriter();
+            }
+            deleteSessionFiles();
+        }, "RadioTimeshiftCleanup");
+        cleanup.setDaemon(true);
+        cleanup.start();
     }
 
-    private void deleteAbandonedSessions() {
-        File[] files = directory.listFiles(
-                file -> file.isFile() && file.getName().startsWith(FILE_PREFIX));
-        if (files == null) {
-            return;
-        }
-        for (File file : files) {
-            //noinspection ResultOfMethodCallIgnored
-            file.delete();
-        }
+    /** Removes files left by sessions that never got to clean up (for example a killed process). */
+    private void deleteAbandonedSessionsAsync() {
+        Thread cleanup = new Thread(() -> {
+            File[] files = directory.listFiles(file -> file.isFile()
+                    && file.getName().startsWith(FILE_PREFIX)
+                    && !file.getName().startsWith(FILE_PREFIX + sessionId));
+            if (files == null) {
+                return;
+            }
+            for (File file : files) {
+                //noinspection ResultOfMethodCallIgnored
+                file.delete();
+            }
+        }, "RadioTimeshiftSweep");
+        cleanup.setDaemon(true);
+        cleanup.start();
     }
 
     private void deleteSessionFiles() {
+        List<File> toDelete = new ArrayList<>();
         synchronized (monitor) {
             for (Segment segment : segments) {
-                //noinspection ResultOfMethodCallIgnored
-                segment.file.delete();
+                toDelete.add(segment.file);
             }
+            toDelete.addAll(expiredFiles);
             segments.clear();
             checkpoints.clear();
+            updateRetainedStartLocked();
             activeReaders.clear();
+            expiredFiles.clear();
+        }
+        for (File file : toDelete) {
+            //noinspection ResultOfMethodCallIgnored
+            file.delete();
         }
     }
 
