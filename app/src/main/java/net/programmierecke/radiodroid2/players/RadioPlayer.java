@@ -72,7 +72,11 @@ public class RadioPlayer implements PlayerWrapper.PlayListener, Recordable {
 
             playerListener.onBufferedTimeUpdate(bufferTimeMs);
 
-            if (BuildConfig.DEBUG) Log.d(TAG, String.format("buffered %d ms.", bufferTimeMs));
+            if (BuildConfig.DEBUG) {
+                Log.d(TAG, String.format("buffered %d ms, position %d ms, live edge %d ms.",
+                        bufferTimeMs, currentPlayer.getCurrentPositionMs(),
+                        currentPlayer.getLiveEdgePositionMs()));
+            }
 
             playerThreadHandler.postDelayed(this, 2000);
         }

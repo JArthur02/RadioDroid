@@ -246,7 +246,8 @@ public class ExoPlayerWrapper implements PlayerWrapper, IcyDataSource.IcyDataSou
         if (!canPauseInPlace()) {
             return false;
         }
-        Log.i(TAG, "Pausing exoplayer in place.");
+        Log.i(TAG, "Pausing exoplayer in place at " + getCurrentPositionMs() + " ms, live edge "
+                + getLiveEdgePositionMs() + " ms.");
         pausedInPlace = true;
         player.setPlayWhenReady(false);
         return true;
@@ -258,7 +259,8 @@ public class ExoPlayerWrapper implements PlayerWrapper, IcyDataSource.IcyDataSou
             pausedInPlace = false;
             return false;
         }
-        Log.i(TAG, "Resuming exoplayer from where it paused.");
+        Log.i(TAG, "Resuming exoplayer from where it paused, at " + getCurrentPositionMs()
+                + " ms, live edge " + getLiveEdgePositionMs() + " ms.");
         // Clear first: setPlayWhenReady fires the state callback that reports Playing.
         pausedInPlace = false;
         player.setPlayWhenReady(true);
