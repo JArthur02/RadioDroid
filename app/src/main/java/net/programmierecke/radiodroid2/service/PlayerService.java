@@ -11,6 +11,7 @@ import android.app.PendingIntent;
 import android.bluetooth.BluetoothA2dp;
 import android.bluetooth.BluetoothHeadset;
 import android.content.Context;
+import android.net.ConnectivityManager;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.SharedPreferences;
@@ -47,6 +48,7 @@ import android.widget.Toast;
 import androidx.core.app.NotificationCompat;
 import androidx.core.app.NotificationManagerCompat;
 import androidx.core.content.res.ResourcesCompat;
+import androidx.core.net.ConnectivityManagerCompat;
 import androidx.core.graphics.drawable.RoundedBitmapDrawable;
 import androidx.core.graphics.drawable.RoundedBitmapDrawableFactory;
 import androidx.localbroadcastmanager.content.LocalBroadcastManager;
@@ -112,9 +114,10 @@ public class PlayerService extends JobIntentService implements RadioPlayer.Playe
     // How often to check whether scrubbing became available (or went away) while playing, so the
     // notification can add or drop the rewind/forward buttons.
     private static final long SEEK_AVAILABILITY_CHECK_MS = 3000L;
-    // How long a session paused by another app's audio is held (and kept recording) so it can
-    // continue from where it stopped; after that it is released and resuming starts live.
-    private static final long PAUSED_SESSION_KEEP_MS = 10 * 60 * 1000L;
+    // How long a paused session is held (and kept recording) so it can continue from where it
+    // stopped; after that it is released and resuming starts live. Shorter on mobile data.
+    private static final long PAUSED_SESSION_KEEP_MS = 30 * 60 * 1000L;
+    private static final long PAUSED_SESSION_KEEP_METERED_MS = 10 * 60 * 1000L;
 
     private static final float FULL_VOLUME = 100f;
     private static final float DUCK_VOLUME = 40f;
@@ -202,6 +205,11 @@ public class PlayerService extends JobIntentService implements RadioPlayer.Playe
 
         public void Resume() throws RemoteException {
             PlayerService.this.resume();
+        }
+
+        @Override
+        public boolean hasPausedSession() throws RemoteException {
+            return radioPlayer != null && radioPlayer.hasPausedSession();
         }
 
         public void Stop() throws RemoteException {
@@ -701,15 +709,17 @@ public class PlayerService extends JobIntentService implements RadioPlayer.Playe
             lastMeteredConnectionWarningTime = System.currentTimeMillis();
         }
 
-        // Another app took the audio: pause where we are instead of closing, so playback can
-        // continue from the same point. A short interruption (call, navigation prompt) keeps the
-        // locks so the recording survives; a permanent loss releases them.
-        final boolean interrupted = pauseReason == PauseReason.FOCUS_LOSS_TRANSIENT
-                || pauseReason == PauseReason.FOCUS_LOSS;
+        // Pause where we are instead of closing, so playback continues from the same point
+        // instead of jumping to live. The one exception is a pause made to stop using mobile
+        // data: that one has to really stop.
+        final boolean keepSession = pauseReason != PauseReason.METERED_CONNECTION
+                && radioPlayer.canPauseInPlace();
 
         handler.removeCallbacks(releasePausedSessionTask);
 
-        if (pauseReason != PauseReason.FOCUS_LOSS_TRANSIENT) {
+        // The recorder keeps running while a session is held, so keep the locks that keep the
+        // connection alive until the hold is released.
+        if (!keepSession) {
             releaseWakeLockAndWifiLock();
         }
 
@@ -719,18 +729,24 @@ public class PlayerService extends JobIntentService implements RadioPlayer.Playe
             releaseAudioFocus();
         }
 
-        radioPlayer.pause(interrupted);
+        radioPlayer.pause(keepSession);
 
-        // Also covers a manual pause on top of a session that is already paused in place.
-        if (interrupted || radioPlayer.hasPausedSession()) {
-            handler.postDelayed(releasePausedSessionTask, PAUSED_SESSION_KEEP_MS);
+        if (keepSession) {
+            handler.postDelayed(releasePausedSessionTask, pausedSessionKeepMs());
         }
+    }
+
+    /** How long a paused session keeps recording; shorter on mobile data. */
+    private long pausedSessionKeepMs() {
+        ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+        final boolean metered = cm != null && ConnectivityManagerCompat.isActiveNetworkMetered(cm);
+        return metered ? PAUSED_SESSION_KEEP_METERED_MS : PAUSED_SESSION_KEEP_MS;
     }
 
     private final Runnable releasePausedSessionTask = new Runnable() {
         @Override
         public void run() {
-            if (BuildConfig.DEBUG) Log.d(TAG, "releasing the session paused by interruption.");
+            if (BuildConfig.DEBUG) Log.d(TAG, "releasing the paused session.");
 
             radioPlayer.releasePausedSession();
             releaseWakeLockAndWifiLock();

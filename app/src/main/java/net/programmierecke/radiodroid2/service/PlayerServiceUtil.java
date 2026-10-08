@@ -208,6 +208,25 @@ public class PlayerServiceUtil {
         }
     }
 
+    /**
+     * If playback was paused in place, continues it from where it stopped.
+     *
+     * @return false if there is nothing to continue, so the caller should start the station.
+     */
+    public static boolean resumePausedSession() {
+        if (itsPlayerService != null) {
+            try {
+                if (itsPlayerService.hasPausedSession()) {
+                    itsPlayerService.Resume();
+                    return true;
+                }
+            } catch (RemoteException e) {
+                Log.e("", "" + e);
+            }
+        }
+        return false;
+    }
+
     public static void clearTimer() {
         if (itsPlayerService != null) {
             try {

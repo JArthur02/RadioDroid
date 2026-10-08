@@ -235,10 +235,15 @@ public class ExoPlayerWrapper implements PlayerWrapper, IcyDataSource.IcyDataSou
     }
 
     @Override
-    public boolean pauseInPlace() {
+    public boolean canPauseInPlace() {
         // Only a timeshift session can sit paused: its recorder keeps the live stream going, so
         // playback later continues from the stop point instead of jumping to live.
-        if (player == null || timeshiftBuffer == null) {
+        return player != null && timeshiftBuffer != null;
+    }
+
+    @Override
+    public boolean pauseInPlace() {
+        if (!canPauseInPlace()) {
             return false;
         }
         Log.i(TAG, "Pausing exoplayer in place.");

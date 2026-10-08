@@ -36,6 +36,11 @@ public interface PlayerWrapper extends Recordable {
         return false;
     }
 
+    /** Whether {@link #pauseInPlace()} would currently succeed. */
+    default boolean canPauseInPlace() {
+        return false;
+    }
+
     /**
      * Continues a session paused by {@link #pauseInPlace()}. Returns false if there is none.
      */

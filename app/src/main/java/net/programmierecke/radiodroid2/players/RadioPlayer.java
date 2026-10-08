@@ -175,6 +175,11 @@ public class RadioPlayer implements PlayerWrapper.PlayListener, Recordable {
         });
     }
 
+    /** Whether pausing right now could keep the session for {@link #resumeInPlace()}. */
+    public final boolean canPauseInPlace() {
+        return currentPlayer.canPauseInPlace();
+    }
+
     /** True if the player is paused in place and {@link #resumeInPlace()} can continue it. */
     public final boolean hasPausedSession() {
         return pausedInPlace && playState == PlayState.Paused;

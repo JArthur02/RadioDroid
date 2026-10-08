@@ -348,7 +348,7 @@ public class FragmentPlayerFull extends Fragment {
                     }
 
                     PlayerServiceUtil.pause(PauseReason.USER);
-                } else {
+                } else if (!PlayerServiceUtil.resumePausedSession()) {
                     playLastFromHistory();
                 }
 
