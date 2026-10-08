@@ -1133,7 +1133,9 @@ public class PlayerService extends JobIntentService implements RadioPlayer.Playe
             // first so the target is relative to the stop point and focus is held again.
             resume();
         }
-        radioPlayer.seekTo(radioPlayer.getCurrentPositionMs() + deltaMs);
+        final long from = radioPlayer.getCurrentPositionMs();
+        Log.i(TAG, String.format("seeking by %d ms from %d ms.", deltaMs, from));
+        radioPlayer.seekTo(from + deltaMs);
     }
 
     private final Runnable seekAvailabilityCheck = new Runnable() {
