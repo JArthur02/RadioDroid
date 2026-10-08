@@ -277,11 +277,13 @@ public class IcyDataSource implements HttpDataSource {
     }
 
     private int readInternal(byte[] buffer, int offset, int readLength) throws HttpDataSourceException {
-        if (responseBody == null) {
+        // close() may run on another thread (timeshift recorder is stopped from the player thread).
+        final ResponseBody body = responseBody;
+        if (body == null) {
             throw new HttpDataSourceException(dataSpec, HttpDataSourceException.TYPE_READ);
         }
 
-        InputStream stream = responseBody.byteStream();
+        InputStream stream = body.byteStream();
 
         int bytesRead = 0;
         try {

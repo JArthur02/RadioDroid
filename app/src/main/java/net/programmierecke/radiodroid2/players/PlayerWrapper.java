@@ -27,6 +27,27 @@ public interface PlayerWrapper extends Recordable {
 
     void pause();
 
+    /**
+     * Pauses without tearing the session down so {@link #resumeInPlace()} can continue from the
+     * exact point where playback stopped. Returns false if this player cannot do that, in which
+     * case the caller falls back to {@link #pause()}.
+     */
+    default boolean pauseInPlace() {
+        return false;
+    }
+
+    /** Whether {@link #pauseInPlace()} would currently succeed. */
+    default boolean canPauseInPlace() {
+        return false;
+    }
+
+    /**
+     * Continues a session paused by {@link #pauseInPlace()}. Returns false if there is none.
+     */
+    default boolean resumeInPlace() {
+        return false;
+    }
+
     void stop();
 
     boolean isPlaying();

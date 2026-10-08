@@ -47,4 +47,6 @@ void enableMPD(String hostname, int port);
 void disableMPD();
 
 void warnAboutMeteredConnection(in PlayerType playerType);
+
+boolean hasPausedSession();
 }

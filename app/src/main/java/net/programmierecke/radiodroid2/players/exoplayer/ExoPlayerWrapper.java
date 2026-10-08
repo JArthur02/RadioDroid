@@ -78,6 +78,8 @@ public class ExoPlayerWrapper implements PlayerWrapper, IcyDataSource.IcyDataSou
     private TimeshiftBuffer timeshiftBuffer;
     private long playbackBasePositionMs;
     private boolean networkReceiverRegistered;
+    // True while paused by pauseInPlace(); state callbacks are ignored until resumeInPlace().
+    private boolean pausedInPlace;
 
     private Runnable fullStopTask;
 
@@ -108,6 +110,7 @@ public class ExoPlayerWrapper implements PlayerWrapper, IcyDataSource.IcyDataSou
         this.context = context;
         this.streamUrl = streamUrl;
 
+        pausedInPlace = false;
         cancelStopTask();
 
         stateListener.onStateChanged(PlayState.PrePlaying);
@@ -219,6 +222,7 @@ public class ExoPlayerWrapper implements PlayerWrapper, IcyDataSource.IcyDataSou
     public void pause() {
         Log.i(TAG, "Pause. Stopping exoplayer.");
 
+        pausedInPlace = false;
         cancelStopTask();
 
         unregisterNetworkReceiver();
@@ -231,9 +235,43 @@ public class ExoPlayerWrapper implements PlayerWrapper, IcyDataSource.IcyDataSou
     }
 
     @Override
+    public boolean canPauseInPlace() {
+        // Only a timeshift session can sit paused: its recorder keeps the live stream going, so
+        // playback later continues from the stop point instead of jumping to live.
+        return player != null && timeshiftBuffer != null;
+    }
+
+    @Override
+    public boolean pauseInPlace() {
+        if (!canPauseInPlace()) {
+            return false;
+        }
+        Log.i(TAG, "Pausing exoplayer in place at " + getCurrentPositionMs() + " ms, live edge "
+                + getLiveEdgePositionMs() + " ms.");
+        pausedInPlace = true;
+        player.setPlayWhenReady(false);
+        return true;
+    }
+
+    @Override
+    public boolean resumeInPlace() {
+        if (!pausedInPlace || player == null || timeshiftBuffer == null) {
+            pausedInPlace = false;
+            return false;
+        }
+        Log.i(TAG, "Resuming exoplayer from where it paused, at " + getCurrentPositionMs()
+                + " ms, live edge " + getLiveEdgePositionMs() + " ms.");
+        // Clear first: setPlayWhenReady fires the state callback that reports Playing.
+        pausedInPlace = false;
+        player.setPlayWhenReady(true);
+        return true;
+    }
+
+    @Override
     public void stop() {
         Log.i(TAG, "Stopping exoplayer.");
 
+        pausedInPlace = false;
         cancelStopTask();
 
         unregisterNetworkReceiver();
@@ -299,6 +337,8 @@ public class ExoPlayerWrapper implements PlayerWrapper, IcyDataSource.IcyDataSou
         }
 
         if (timeshiftBuffer != null) {
+            // Scrubbing while paused in place starts playback at the new position.
+            pausedInPlace = false;
             TimeshiftBuffer.SeekTarget target = timeshiftBuffer.resolveSeekTarget(positionMs);
             playbackBasePositionMs = target.timeMs;
             audioSource = createTimeshiftMediaSource(target);
@@ -582,6 +622,12 @@ public class ExoPlayerWrapper implements PlayerWrapper, IcyDataSource.IcyDataSou
         @Override
         public void onPlayerStateChanged(EventTime eventTime, boolean playWhenReady, int playbackState) {
             isPlayingFlag = playbackState == Player.STATE_READY || playbackState == Player.STATE_BUFFERING;
+
+            if (pausedInPlace) {
+                // setPlayWhenReady(false) and any re-buffering while paused also arrive here;
+                // none of it should turn the app's paused state back into playing.
+                return;
+            }
 
             switch (playbackState) {
                 case Player.STATE_READY:

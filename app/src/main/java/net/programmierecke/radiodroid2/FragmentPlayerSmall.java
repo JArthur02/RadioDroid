@@ -111,7 +111,7 @@ public class FragmentPlayerSmall extends Fragment {
                 }
 
                 PlayerServiceUtil.pause(PauseReason.USER);
-            } else {
+            } else if (!PlayerServiceUtil.resumePausedSession()) {
                 playLastFromHistory();
             }
         });
