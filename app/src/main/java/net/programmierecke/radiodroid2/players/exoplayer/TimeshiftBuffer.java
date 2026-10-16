@@ -117,6 +117,11 @@ final class TimeshiftBuffer {
     private final List<BufferDataSource> activeReaders = new ArrayList<>();
 
     private volatile boolean running;
+    // Set once close() is called. The recorder thread can outlive close() by a moment (it is
+    // stopped asynchronously); after that it must not report anything to the player, which is
+    // already playing the next station. A late "connection lost irrecoverably" from the old
+    // session would otherwise stop the new one.
+    private volatile boolean closed;
     private volatile IcyDataSource upstream;
     private volatile IOException terminalError;
 
@@ -403,7 +408,7 @@ final class TimeshiftBuffer {
                     IOException error = failure instanceof IOException
                             ? (IOException) failure
                             : new IOException(failure);
-                    if (!running) {
+                    if (!running || closed) {
                         break;
                     }
 
@@ -415,7 +420,9 @@ final class TimeshiftBuffer {
                     if (budgetMs == 0
                             || System.currentTimeMillis() - firstFailureAt >= budgetMs) {
                         fail(error);
-                        downstreamListener.onDataSourceConnectionLostIrrecoverably();
+                        if (!closed) {
+                            downstreamListener.onDataSourceConnectionLostIrrecoverably();
+                        }
                         break;
                     }
 
@@ -449,7 +456,9 @@ final class TimeshiftBuffer {
     private final class RecordingListener implements IcyDataSource.IcyDataSourceListener {
         @Override
         public void onDataSourceConnected() {
-            downstreamListener.onDataSourceConnected();
+            if (!closed) {
+                downstreamListener.onDataSourceConnected();
+            }
         }
 
         @Override
@@ -459,7 +468,9 @@ final class TimeshiftBuffer {
 
         @Override
         public void onDataSourceConnectionLostIrrecoverably() {
-            downstreamListener.onDataSourceConnectionLostIrrecoverably();
+            if (!closed) {
+                downstreamListener.onDataSourceConnectionLostIrrecoverably();
+            }
         }
 
         @Override
@@ -469,24 +480,34 @@ final class TimeshiftBuffer {
                     applyBitrateLocked(shoutcastInfo.bitrate);
                 }
             }
-            downstreamListener.onDataSourceShoutcastInfo(shoutcastInfo);
+            if (!closed) {
+                downstreamListener.onDataSourceShoutcastInfo(shoutcastInfo);
+            }
         }
 
         @Override
         public void onDataSourceStreamLiveInfo(StreamLiveInfo liveInfo) {
-            downstreamListener.onDataSourceStreamLiveInfo(liveInfo);
+            if (!closed) {
+                downstreamListener.onDataSourceStreamLiveInfo(liveInfo);
+            }
         }
 
         @Override
         public void onDataSourceBytesRead(byte[] buffer, int offset, int length) {
-            if (length <= 0 || !running) {
+            if (length <= 0 || !running || closed) {
                 return;
             }
 
             try {
                 appendAudio(buffer, offset, length);
-                downstreamListener.onDataSourceBytesRead(buffer, offset, length);
+                if (!closed) {
+                    downstreamListener.onDataSourceBytesRead(buffer, offset, length);
+                }
             } catch (IOException error) {
+                if (closed) {
+                    // close() shut the segment file under us while we were writing; expected.
+                    return;
+                }
                 fail(error);
                 downstreamListener.onDataSourceConnectionLostIrrecoverably();
             }
@@ -801,6 +822,7 @@ final class TimeshiftBuffer {
      * the recorder, deleting up to two hours of segment files) to a short-lived cleanup thread.
      */
     public void close() {
+        closed = true;
         final Thread recorder;
         synchronized (monitor) {
             running = false;

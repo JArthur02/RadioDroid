@@ -689,6 +689,9 @@ public class PlayerService extends JobIntentService implements RadioPlayer.Playe
 
             liveInfo = new StreamLiveInfo(null);
             streamInfo = null;
+            // Set again once the new station is playing; until then the notification timer
+            // should not count from the previous station's start.
+            lastPlayStartTime = 0;
 
             acquireWakeLockAndWifiLock();
 
@@ -892,7 +895,7 @@ public class PlayerService extends JobIntentService implements RadioPlayer.Playe
 
         PlaybackStateCompat.Builder playbackStateBuilder = new PlaybackStateCompat.Builder();
 
-        if (radioPlayer.canSeek()) {
+        if (showSeekActions()) {
             // Standard actions serve Bluetooth and media-key controllers; Android 13+ draws its own
             // media controls from the session, which only shows custom actions in the extra slots.
             actions |= PlaybackStateCompat.ACTION_REWIND | PlaybackStateCompat.ACTION_FAST_FORWARD;
@@ -1057,7 +1060,10 @@ public class PlayerService extends JobIntentService implements RadioPlayer.Playe
                 .setContentIntent(contentIntent)
                 .setContentTitle(theTitle)
                 .setContentText(theMessage)
-                .setWhen(System.currentTimeMillis())
+                // Rebuilt on every state and title change: keep the elapsed timer counting from
+                // when playback started and don't re-alert, or the notification visibly jumps.
+                .setWhen(lastPlayStartTime > 0 ? lastPlayStartTime : System.currentTimeMillis())
+                .setOnlyAlertOnce(true)
                 .setTicker(theTicker)
                 .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
                 .setSmallIcon(R.drawable.ic_play_arrow_white_24dp)
@@ -1066,7 +1072,7 @@ public class PlayerService extends JobIntentService implements RadioPlayer.Playe
 
         // A media notification shows at most five buttons. While the stream can be scrubbed, swap
         // "previous" for "back 30 seconds" and add "forward 30 seconds" next to play/pause.
-        final boolean canSeek = radioPlayer.canSeek();
+        final boolean canSeek = showSeekActions();
         notificationShowsSeekActions = canSeek;
         if (canSeek) {
             Intent rewindIntent = new Intent(itsContext, PlayerService.class);
@@ -1138,13 +1144,23 @@ public class PlayerService extends JobIntentService implements RadioPlayer.Playe
         radioPlayer.seekTo(from + deltaMs);
     }
 
+    /**
+     * Whether the notification and media session offer back/forward 30 seconds. True for the
+     * whole timeshift session, not only once enough audio is buffered to seek: switching the
+     * button layout a few seconds into every station makes the controls jump under the finger.
+     * Until seeking is possible the buttons do nothing (see {@link #seekRelative(long)}).
+     */
+    private boolean showSeekActions() {
+        return radioPlayer.canSeek() || radioPlayer.canPauseInPlace();
+    }
+
     private final Runnable seekAvailabilityCheck = new Runnable() {
         @Override
         public void run() {
             if (radioPlayer.getPlayState() != PlayState.Playing) {
                 return;
             }
-            if (radioPlayer.canSeek() != notificationShowsSeekActions) {
+            if (showSeekActions() != notificationShowsSeekActions) {
                 updateNotification();
             }
             handler.postDelayed(this, SEEK_AVAILABILITY_CHECK_MS);
