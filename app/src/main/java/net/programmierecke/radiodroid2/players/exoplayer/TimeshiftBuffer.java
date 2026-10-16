@@ -435,7 +435,8 @@ final class TimeshiftBuffer {
                 } finally {
                     try {
                         source.close();
-                    } catch (IOException ignored) {
+                    } catch (IOException | RuntimeException ignored) {
+                        // Never let a failure while closing kill the app from a background thread.
                     }
                     upstream = null;
                 }
@@ -811,7 +812,8 @@ final class TimeshiftBuffer {
         if (source != null) {
             try {
                 source.close();
-            } catch (IOException ignored) {
+            } catch (IOException | RuntimeException ignored) {
+                // Never let a failure while closing kill the app from a background thread.
             }
         }
     }
@@ -835,7 +837,8 @@ final class TimeshiftBuffer {
             if (source != null) {
                 try {
                     source.close();
-                } catch (IOException ignored) {
+                } catch (IOException | RuntimeException ignored) {
+                    // Never let a failure while closing kill the app from a background thread.
                 }
             }
             if (recorder != null) {
