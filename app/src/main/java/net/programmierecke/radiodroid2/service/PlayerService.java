@@ -11,6 +11,7 @@ import android.app.PendingIntent;
 import android.bluetooth.BluetoothA2dp;
 import android.bluetooth.BluetoothHeadset;
 import android.content.Context;
+import android.net.ConnectivityManager;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.SharedPreferences;
@@ -47,6 +48,7 @@ import android.widget.Toast;
 import androidx.core.app.NotificationCompat;
 import androidx.core.app.NotificationManagerCompat;
 import androidx.core.content.res.ResourcesCompat;
+import androidx.core.net.ConnectivityManagerCompat;
 import androidx.core.graphics.drawable.RoundedBitmapDrawable;
 import androidx.core.graphics.drawable.RoundedBitmapDrawableFactory;
 import androidx.localbroadcastmanager.content.LocalBroadcastManager;
@@ -102,6 +104,20 @@ public class PlayerService extends JobIntentService implements RadioPlayer.Playe
     private final String ACTION_SKIP_TO_NEXT = "next";
     private final String ACTION_SKIP_TO_PREVIOUS = "previous";
     private final String ACTION_STOP = "stop";
+    private final String ACTION_REWIND = "rewind30";
+    private final String ACTION_FORWARD = "forward30";
+
+    static final String CUSTOM_ACTION_REWIND = "net.programmierecke.radiodroid2.REWIND_30";
+    static final String CUSTOM_ACTION_FORWARD = "net.programmierecke.radiodroid2.FORWARD_30";
+
+    static final long SEEK_STEP_MS = 30 * 1000L;
+    // How often to check whether scrubbing became available (or went away) while playing, so the
+    // notification can add or drop the rewind/forward buttons.
+    private static final long SEEK_AVAILABILITY_CHECK_MS = 3000L;
+    // How long a paused session is held (and kept recording) so it can continue from where it
+    // stopped; after that it is released and resuming starts live. Shorter on mobile data.
+    private static final long PAUSED_SESSION_KEEP_MS = 30 * 60 * 1000L;
+    private static final long PAUSED_SESSION_KEEP_METERED_MS = 10 * 60 * 1000L;
 
     private static final float FULL_VOLUME = 100f;
     private static final float DUCK_VOLUME = 40f;
@@ -116,6 +132,8 @@ public class PlayerService extends JobIntentService implements RadioPlayer.Playe
 
     private Context itsContext;
     private Handler handler;
+
+    private boolean notificationShowsSeekActions;
 
     private DataRadioStation currentStation;
 
@@ -187,6 +205,11 @@ public class PlayerService extends JobIntentService implements RadioPlayer.Playe
 
         public void Resume() throws RemoteException {
             PlayerService.this.resume();
+        }
+
+        @Override
+        public boolean hasPausedSession() throws RemoteException {
+            return radioPlayer != null && radioPlayer.hasPausedSession();
         }
 
         public void Stop() throws RemoteException {
@@ -577,6 +600,12 @@ public class PlayerService extends JobIntentService implements RadioPlayer.Playe
                     case ACTION_RESUME:
                         resume();
                         break;
+                    case ACTION_REWIND:
+                        seekRelative(-SEEK_STEP_MS);
+                        break;
+                    case ACTION_FORWARD:
+                        seekRelative(SEEK_STEP_MS);
+                        break;
                     case ACTION_MEDIA_BUTTON:
                         KeyEvent key = (KeyEvent) intent.getParcelableExtra(Intent.EXTRA_KEY_EVENT);
                         if (key.getAction() == KeyEvent.ACTION_UP) {
@@ -660,6 +689,9 @@ public class PlayerService extends JobIntentService implements RadioPlayer.Playe
 
             liveInfo = new StreamLiveInfo(null);
             streamInfo = null;
+            // Set again once the new station is playing; until then the notification timer
+            // should not count from the previous station's start.
+            lastPlayStartTime = 0;
 
             acquireWakeLockAndWifiLock();
 
@@ -680,7 +712,19 @@ public class PlayerService extends JobIntentService implements RadioPlayer.Playe
             lastMeteredConnectionWarningTime = System.currentTimeMillis();
         }
 
-        releaseWakeLockAndWifiLock();
+        // Pause where we are instead of closing, so playback continues from the same point
+        // instead of jumping to live. The one exception is a pause made to stop using mobile
+        // data: that one has to really stop.
+        final boolean keepSession = pauseReason != PauseReason.METERED_CONNECTION
+                && radioPlayer.canPauseInPlace();
+
+        handler.removeCallbacks(releasePausedSessionTask);
+
+        // The recorder keeps running while a session is held, so keep the locks that keep the
+        // connection alive until the hold is released.
+        if (!keepSession) {
+            releaseWakeLockAndWifiLock();
+        }
 
         // Pausing due to focus loss means that we can gain it again
         // so we should keep the focus and the wait for callback.
@@ -688,8 +732,34 @@ public class PlayerService extends JobIntentService implements RadioPlayer.Playe
             releaseAudioFocus();
         }
 
-        radioPlayer.pause();
+        radioPlayer.pause(keepSession);
+
+        if (keepSession) {
+            handler.postDelayed(releasePausedSessionTask, pausedSessionKeepMs());
+        }
     }
+
+    /** How long a paused session keeps recording; shorter on mobile data. */
+    private long pausedSessionKeepMs() {
+        ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+        final boolean metered = cm != null && ConnectivityManagerCompat.isActiveNetworkMetered(cm);
+        return metered ? PAUSED_SESSION_KEEP_METERED_MS : PAUSED_SESSION_KEEP_MS;
+    }
+
+    private final Runnable releasePausedSessionTask = new Runnable() {
+        @Override
+        public void run() {
+            if (BuildConfig.DEBUG) Log.d(TAG, "releasing the paused session.");
+
+            radioPlayer.releasePausedSession();
+            releaseWakeLockAndWifiLock();
+            if (pauseReason == PauseReason.FOCUS_LOSS_TRANSIENT) {
+                // Nobody will hand the focus back to a released session.
+                pauseReason = PauseReason.NONE;
+                releaseAudioFocus();
+            }
+        }
+    };
 
     public void next() {
         if (currentStation == null) {
@@ -742,6 +812,20 @@ public class PlayerService extends JobIntentService implements RadioPlayer.Playe
         this.pauseReason = PauseReason.NONE;
         this.lastMeteredConnectionWarningTime = 0;
 
+        handler.removeCallbacks(releasePausedSessionTask);
+
+        // Paused by an interruption: continue the same session from the stop point. No station
+        // lookup is needed, so this also works without a network connection.
+        if (!radioPlayer.isPlaying() && radioPlayer.hasPausedSession()
+                && acquireAudioFocus() == AudioManager.AUDIOFOCUS_REQUEST_GRANTED) {
+            enableMediaSession();
+            acquireWakeLockAndWifiLock();
+            startMeteredConnectionListener();
+            if (radioPlayer.resumeInPlace()) {
+                return;
+            }
+        }
+
         if (!radioPlayer.isPlaying()) {
             RadioDroidApp radioDroidApp = (RadioDroidApp) getApplication();
             DataRadioStation station = currentStation;
@@ -771,6 +855,7 @@ public class PlayerService extends JobIntentService implements RadioPlayer.Playe
         this.pauseReason = PauseReason.NONE;
         this.lastMeteredConnectionWarningTime = 0;
         this.notificationIsActive = false;
+        handler.removeCallbacks(releasePausedSessionTask);
 
         liveInfo = new StreamLiveInfo(null);
         streamInfo = null;
@@ -809,6 +894,16 @@ public class PlayerService extends JobIntentService implements RadioPlayer.Playe
         }
 
         PlaybackStateCompat.Builder playbackStateBuilder = new PlaybackStateCompat.Builder();
+
+        if (showSeekActions()) {
+            // Standard actions serve Bluetooth and media-key controllers; Android 13+ draws its own
+            // media controls from the session, which only shows custom actions in the extra slots.
+            actions |= PlaybackStateCompat.ACTION_REWIND | PlaybackStateCompat.ACTION_FAST_FORWARD;
+            playbackStateBuilder.addCustomAction(new PlaybackStateCompat.CustomAction.Builder(
+                    CUSTOM_ACTION_REWIND, getString(R.string.action_rewind_30), R.drawable.ic_replay_30_24dp).build());
+            playbackStateBuilder.addCustomAction(new PlaybackStateCompat.CustomAction.Builder(
+                    CUSTOM_ACTION_FORWARD, getString(R.string.action_forward_30), R.drawable.ic_forward_30_24dp).build());
+        }
         playbackStateBuilder.setActions(actions);
 
         if (state == PlaybackStateCompat.STATE_ERROR) {
@@ -965,13 +1060,28 @@ public class PlayerService extends JobIntentService implements RadioPlayer.Playe
                 .setContentIntent(contentIntent)
                 .setContentTitle(theTitle)
                 .setContentText(theMessage)
-                .setWhen(System.currentTimeMillis())
+                // Rebuilt on every state and title change: keep the elapsed timer counting from
+                // when playback started and don't re-alert, or the notification visibly jumps.
+                .setWhen(lastPlayStartTime > 0 ? lastPlayStartTime : System.currentTimeMillis())
+                .setOnlyAlertOnce(true)
                 .setTicker(theTicker)
                 .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
                 .setSmallIcon(R.drawable.ic_play_arrow_white_24dp)
                 .setLargeIcon(radioIcon.getBitmap())
-                .addAction(R.drawable.ic_stop_white_24dp, getString(R.string.action_stop), pendingIntentStop)
-                .addAction(R.drawable.ic_skip_previous_24dp, getString(R.string.action_skip_to_previous), pendingIntentPrevious);
+                .addAction(R.drawable.ic_stop_white_24dp, getString(R.string.action_stop), pendingIntentStop);
+
+        // A media notification shows at most five buttons. While the stream can be scrubbed, swap
+        // "previous" for "back 30 seconds" and add "forward 30 seconds" next to play/pause.
+        final boolean canSeek = showSeekActions();
+        notificationShowsSeekActions = canSeek;
+        if (canSeek) {
+            Intent rewindIntent = new Intent(itsContext, PlayerService.class);
+            rewindIntent.setAction(ACTION_REWIND);
+            PendingIntent pendingIntentRewind = PendingIntent.getService(itsContext, 0, rewindIntent, pendingIntentFlag);
+            notificationBuilder.addAction(R.drawable.ic_replay_30_24dp, getString(R.string.action_rewind_30), pendingIntentRewind);
+        } else {
+            notificationBuilder.addAction(R.drawable.ic_skip_previous_24dp, getString(R.string.action_skip_to_previous), pendingIntentPrevious);
+        }
 
         if (currentPlayerState == PlayState.Playing || currentPlayerState == PlayState.PrePlaying) {
             Intent pauseIntent = new Intent(itsContext, PlayerService.class);
@@ -992,10 +1102,18 @@ public class PlayerService extends JobIntentService implements RadioPlayer.Playe
                     .setOngoing(false);
         }
 
+        if (canSeek) {
+            Intent forwardIntent = new Intent(itsContext, PlayerService.class);
+            forwardIntent.setAction(ACTION_FORWARD);
+            PendingIntent pendingIntentForward = PendingIntent.getService(itsContext, 0, forwardIntent, pendingIntentFlag);
+            notificationBuilder.addAction(R.drawable.ic_forward_30_24dp, getString(R.string.action_forward_30), pendingIntentForward);
+        }
+
         notificationBuilder.addAction(R.drawable.ic_skip_next_24dp, getString(R.string.action_skip_to_next), pendingIntentNext)
                 .setStyle(new MediaStyle()
                         .setMediaSession(mediaSession.getSessionToken())
-                        .setShowActionsInCompactView(1, 2, 3 /* previous, play/pause, next */)
+                        // previous (or back 30), play/pause, next (or forward 30)
+                        .setShowActionsInCompactView(1, 2, 3)
                         .setCancelButtonIntent(pendingIntentStop)
                         .setShowCancelButton(true));
         Notification notification = notificationBuilder.build();
@@ -1006,6 +1124,52 @@ public class PlayerService extends JobIntentService implements RadioPlayer.Playe
         if (currentPlayerState == PlayState.Paused || currentPlayerState == PlayState.Idle) {
             stopForeground(false); // necessary to make notification dismissible
         }
+    }
+
+    /**
+     * Moves the playhead by {@code deltaMs} relative to where it is now. The player clamps the
+     * target to what is still buffered, so repeated taps stop at the oldest audio or at live.
+     */
+    void seekRelative(long deltaMs) {
+        if (radioPlayer == null || !radioPlayer.canSeek()) {
+            return;
+        }
+        if (!radioPlayer.isPlaying()) {
+            // Paused in place (for example after an interruption): pick the session back up
+            // first so the target is relative to the stop point and focus is held again.
+            resume();
+        }
+        final long from = radioPlayer.getCurrentPositionMs();
+        Log.i(TAG, String.format("seeking by %d ms from %d ms.", deltaMs, from));
+        radioPlayer.seekTo(from + deltaMs);
+    }
+
+    /**
+     * Whether the notification and media session offer back/forward 30 seconds. True for the
+     * whole timeshift session, not only once enough audio is buffered to seek: switching the
+     * button layout a few seconds into every station makes the controls jump under the finger.
+     * Until seeking is possible the buttons do nothing (see {@link #seekRelative(long)}).
+     */
+    private boolean showSeekActions() {
+        return radioPlayer.canSeek() || radioPlayer.canPauseInPlace();
+    }
+
+    private final Runnable seekAvailabilityCheck = new Runnable() {
+        @Override
+        public void run() {
+            if (radioPlayer.getPlayState() != PlayState.Playing) {
+                return;
+            }
+            if (showSeekActions() != notificationShowsSeekActions) {
+                updateNotification();
+            }
+            handler.postDelayed(this, SEEK_AVAILABILITY_CHECK_MS);
+        }
+    };
+
+    private void startSeekAvailabilityCheck() {
+        handler.removeCallbacks(seekAvailabilityCheck);
+        handler.postDelayed(seekAvailabilityCheck, SEEK_AVAILABILITY_CHECK_MS);
     }
 
     private void toastOnUi(final int messageId) {
@@ -1239,6 +1403,12 @@ public class PlayerService extends JobIntentService implements RadioPlayer.Playe
                 }
 
                 updateNotification(state);
+
+                if (state == PlayState.Playing) {
+                    startSeekAvailabilityCheck();
+                } else {
+                    handler.removeCallbacks(seekAvailabilityCheck);
+                }
 
                 final Intent intent = new Intent();
                 intent.setAction(PLAYER_SERVICE_STATE_CHANGE);

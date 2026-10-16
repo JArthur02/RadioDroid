@@ -27,6 +27,8 @@
     <string name="action_skip_to_next">Next</string>
     <string name="action_pause">Pause</string>
     <string name="action_skip_to_previous">Previous</string>
+    <string name="action_rewind_30">Back 30 seconds</string>
+    <string name="action_forward_30">Forward 30 seconds</string>
     <string name="action_resume">Resume</string>
     <string name="action_stop">Stop</string>
     <string name="action_search">Search</string>

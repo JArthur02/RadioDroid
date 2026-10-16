@@ -88,6 +88,45 @@ class IcyDataSourceTest {
         assertEquals("X", lastLiveInfo.getTitle());
     }
 
+    @Test
+    void close_reportsTransferEndOnce_whenTwoThreadsCloseAtTheSameTime() throws Exception {
+        // The timeshift recorder and the thread stopping it both close the same source when the
+        // station changes. ExoPlayer's bandwidth meter throws on a second onTransferEnd, which
+        // used to crash the app from a background thread.
+        final java.util.concurrent.atomic.AtomicInteger ends = new java.util.concurrent.atomic.AtomicInteger();
+        final IcyDataSource source = new IcyDataSource(new OkHttpClient(), new TestTransferListener() {
+            @Override
+            public void onTransferEnd(DataSource source, DataSpec dataSpec, boolean isNetwork) {
+                ends.incrementAndGet();
+            }
+        }, new TestDataSourceListener());
+        final java.lang.reflect.Field openedField = IcyDataSource.class.getDeclaredField("opened");
+        openedField.setAccessible(true);
+        final java.util.concurrent.atomic.AtomicBoolean opened =
+                (java.util.concurrent.atomic.AtomicBoolean) openedField.get(source);
+
+        final int rounds = 2000;
+        for (int i = 0; i < rounds; i++) {
+            opened.set(true);
+            final java.util.concurrent.CyclicBarrier start = new java.util.concurrent.CyclicBarrier(2);
+            Runnable closer = () -> {
+                try {
+                    start.await();
+                    source.close();
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            };
+            Thread a = new Thread(closer);
+            Thread b = new Thread(closer);
+            a.start();
+            b.start();
+            a.join();
+            b.join();
+        }
+        assertEquals(rounds, ends.get());
+    }
+
     class TestDataSourceListener implements IcyDataSource.IcyDataSourceListener {
 
         @Override

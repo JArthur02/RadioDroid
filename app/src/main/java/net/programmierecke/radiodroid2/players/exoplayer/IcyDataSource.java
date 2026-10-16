@@ -21,6 +21,7 @@ import java.nio.charset.Charset;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import okhttp3.HttpUrl;
 import okhttp3.MediaType;
@@ -88,7 +89,11 @@ public class IcyDataSource implements HttpDataSource {
     int remainingUntilMetadata = Integer.MAX_VALUE;
     private int metadataFrameSize = 0;
     private final ByteArrayOutputStream metadataBuffer = new ByteArrayOutputStream();
-    private boolean opened;
+    // close() runs on more than one thread (the timeshift recorder and the thread that stops it).
+    // The transfer listener (ExoPlayer's DefaultBandwidthMeter) asserts that every transfer ends
+    // exactly once, after it started; a second onTransferEnd throws IllegalStateException on a
+    // background thread and takes the app down. So the flag is atomic and set only after start.
+    private final AtomicBoolean opened = new AtomicBoolean();
 
     ShoutcastInfo shoutcastInfo;
     private StreamLiveInfo streamLiveInfo;
@@ -152,10 +157,9 @@ public class IcyDataSource implements HttpDataSource {
             throw new InvalidContentTypeException(type, dataSpec);
         }
 
-        opened = true;
-
         dataSourceListener.onDataSourceConnected();
         transferListener.onTransferStart(this, dataSpec, true);
+        opened.set(true);
 
         if (type.equals("application/vnd.apple.mpegurl") || type.equals("application/x-mpegurl")) {
             return responseBody.contentLength();
@@ -179,8 +183,7 @@ public class IcyDataSource implements HttpDataSource {
 
     @Override
     public void close() throws HttpDataSourceException {
-        if (opened) {
-            opened = false;
+        if (opened.compareAndSet(true, false)) {
             transferListener.onTransferEnd(this, dataSpec, true);
         }
 
@@ -277,11 +280,13 @@ public class IcyDataSource implements HttpDataSource {
     }
 
     private int readInternal(byte[] buffer, int offset, int readLength) throws HttpDataSourceException {
-        if (responseBody == null) {
+        // close() may run on another thread (timeshift recorder is stopped from the player thread).
+        final ResponseBody body = responseBody;
+        if (body == null) {
             throw new HttpDataSourceException(dataSpec, HttpDataSourceException.TYPE_READ);
         }
 
-        InputStream stream = responseBody.byteStream();
+        InputStream stream = body.byteStream();
 
         int bytesRead = 0;
         try {

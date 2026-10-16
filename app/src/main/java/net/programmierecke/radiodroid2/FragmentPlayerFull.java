@@ -348,7 +348,7 @@ public class FragmentPlayerFull extends Fragment {
                     }
 
                     PlayerServiceUtil.pause(PauseReason.USER);
-                } else {
+                } else if (!PlayerServiceUtil.resumePausedSession()) {
                     playLastFromHistory();
                 }
 
@@ -917,8 +917,12 @@ public class FragmentPlayerFull extends Fragment {
 
                 fragmentPlayerFull.updateRunningRecording();
             } else {
-                fragmentPlayerFull.seekBarPlayhead.setEnabled(false);
-                fragmentPlayerFull.seekBarPlayhead.setVisibility(View.GONE);
+                // Not playing (stopped, or re-buffering after a seek). Keep the bar while the
+                // timeshift session still exists so it does not vanish during a seek; canSeek() is
+                // false once playback has stopped.
+                final boolean canSeek = PlayerServiceUtil.canSeek();
+                fragmentPlayerFull.seekBarPlayhead.setEnabled(canSeek);
+                fragmentPlayerFull.seekBarPlayhead.setVisibility(canSeek ? View.VISIBLE : View.GONE);
             }
         }
     }

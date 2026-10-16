@@ -87,6 +87,36 @@ public class MediaSessionCallback extends MediaSessionCompat.Callback {
     }
 
     @Override
+    public void onRewind() {
+        seekBy(-PlayerService.SEEK_STEP_MS);
+    }
+
+    @Override
+    public void onFastForward() {
+        seekBy(PlayerService.SEEK_STEP_MS);
+    }
+
+    @Override
+    public void onCustomAction(String action, Bundle extras) {
+        if (PlayerService.CUSTOM_ACTION_REWIND.equals(action)) {
+            seekBy(-PlayerService.SEEK_STEP_MS);
+        } else if (PlayerService.CUSTOM_ACTION_FORWARD.equals(action)) {
+            seekBy(PlayerService.SEEK_STEP_MS);
+        }
+    }
+
+    private void seekBy(long deltaMs) {
+        try {
+            if (playerService.canSeek()) {
+                // The player clamps the target to the buffered range.
+                playerService.seekTo(playerService.getCurrentPositionMs() + deltaMs);
+            }
+        } catch (RemoteException e) {
+            e.printStackTrace();
+        }
+    }
+
+    @Override
     public void onStop() {
         try {
             playerService.Stop();
